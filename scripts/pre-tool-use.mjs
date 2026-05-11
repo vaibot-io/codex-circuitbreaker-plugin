@@ -78,11 +78,15 @@ const MODE = process.env.VAIBOT_MODE ?? 'observe'
 // Forensic correlation signal — NOT machine attestation.
 // Used for bootstrap idempotency and abuse pattern detection.
 
-function getFingerprint() {
+// Stable per-machine. NO cwd in the formula — running the plugin from any
+// directory on the same user@host yields the same bootstrap account, so a
+// developer gets exactly ONE bootstrap account per machine. Cross-machine
+// continuity is via the VAIBOT_API_KEY env var (copy the key from
+// ~/.vaibot/credentials.json), not via fingerprint stability.
+export function getFingerprint() {
   const user = userInfo().username
   const host = hostname()
-  const cwd = process.cwd()
-  return createHash('sha256').update(`${user}@${host}:${cwd}`).digest('hex')
+  return createHash('sha256').update(`${user}@${host}`).digest('hex')
 }
 
 // ── Auto-bootstrap ─────────────────────────────────────────────────────────

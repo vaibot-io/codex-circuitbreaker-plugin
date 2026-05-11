@@ -49,11 +49,11 @@ const MODE = process.env.VAIBOT_MODE ?? 'observe'
 const savedCreds = loadSavedCredentials()
 const API_KEY = process.env.VAIBOT_API_KEY ?? savedCreds?.api_key ?? ''
 
+// Stable per-machine. NO cwd in the formula — matches pre-tool-use.mjs.
 function getFingerprint() {
   const user = userInfo().username
   const host = hostname()
-  const cwd = process.cwd()
-  return createHash('sha256').update(`${user}@${host}:${cwd}`).digest('hex')
+  return createHash('sha256').update(`${user}@${host}`).digest('hex')
 }
 
 async function bootstrap() {

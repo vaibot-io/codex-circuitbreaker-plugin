@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { rmSync, existsSync } from 'node:fs'
+import { rmSync, existsSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,7 +36,7 @@ function startMockServer(handler) {
   })
 }
 
-function runHook({ apiUrl, mode = 'enforce', input, env = {} }) {
+function runHook({ apiUrl, mode = 'enforce', input, env = {}, cwd }) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
       env: {
@@ -48,6 +48,7 @@ function runHook({ apiUrl, mode = 'enforce', input, env = {} }) {
         VAIBOT_DASHBOARD_URL: 'https://www.vaibot.io',
         ...env,
       },
+      cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     let stdout = ''
@@ -243,6 +244,79 @@ test('API 5xx in enforce mode without FAIL_OPEN → exit 2 (deny)', async () => 
 
   assert.equal(code, 2, 'fail-closed by default')
   assert.match(stderr, /governance API returned 500/)
+})
+
+test('regression (Change 1): bootstrap fingerprint is cwd-independent', async () => {
+  // Pre-Change-1 the fingerprint formula was sha256(user@host:cwd), which gave
+  // every cwd its own bootstrap account. This test pins down the new formula:
+  // running bootstrap from two different cwds (and two different empty HOMEs
+  // so creds aren't reused) must produce the SAME fingerprint, i.e. one
+  // bootstrap account per machine.
+  clearState()
+  const bootstrapPayloads = []
+  const server = await startMockServer((req) => {
+    if (req.url === '/v2/bootstrap') {
+      bootstrapPayloads.push(req.body)
+      return {
+        status: 201,
+        body: {
+          ok: true,
+          api_key: 'bk_fp_test',
+          user_id: 'usr_fp_test',
+          account_id: '0xfp',
+          wallet_address: '0xfp',
+          wallet_network: 'base-sepolia',
+        },
+      }
+    }
+    if (req.url === '/v2/governance/decide') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          run_id: 'r_fp',
+          risk: { risk: 'low', reason: 'safe' },
+          decision: { decision: 'allow', reason: 'ok' },
+          shadow_decision: { decision: 'allow', reason: 'ok' },
+          content_hash: 'sha256:fp',
+        },
+      }
+    }
+    return null
+  })
+
+  const tmpHomeA = mkdtempSync(join(tmpdir(), 'vaibot-fp-home-a-'))
+  const tmpHomeB = mkdtempSync(join(tmpdir(), 'vaibot-fp-home-b-'))
+  const cwdA = mkdtempSync(join(tmpdir(), 'vaibot-fp-cwd-a-'))
+  const cwdB = mkdtempSync(join(tmpdir(), 'vaibot-fp-cwd-b-'))
+
+  try {
+    await runHook({
+      apiUrl: server.url,
+      input: baseInput,
+      env: { VAIBOT_API_KEY: '', HOME: tmpHomeA },
+      cwd: cwdA,
+    })
+    await runHook({
+      apiUrl: server.url,
+      input: baseInput,
+      env: { VAIBOT_API_KEY: '', HOME: tmpHomeB },
+      cwd: cwdB,
+    })
+  } finally {
+    await server.close()
+    for (const d of [tmpHomeA, tmpHomeB, cwdA, cwdB]) {
+      try { rmSync(d, { recursive: true, force: true }) } catch {}
+    }
+  }
+
+  assert.equal(bootstrapPayloads.length, 2, 'bootstrap should fire twice (once per fresh HOME)')
+  assert.ok(bootstrapPayloads[0].fingerprint, 'fingerprint should be present in payload')
+  assert.equal(
+    bootstrapPayloads[0].fingerprint,
+    bootstrapPayloads[1].fingerprint,
+    'fingerprints from different cwds should match (Change 1: cwd dropped from formula)',
+  )
 })
 
 test('mode=observe + API 5xx → exit 0 (observe always allows)', async () => {
