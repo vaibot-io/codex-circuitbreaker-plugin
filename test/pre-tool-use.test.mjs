@@ -332,3 +332,59 @@ test('mode=observe + API 5xx → exit 0 (observe always allows)', async () => {
 
   assert.equal(code, 0)
 })
+
+test('agent_model is read from hookInput.model (not hardcoded)', async () => {
+  clearState()
+  const server = await startMockServer(() => ({
+    status: 200,
+    body: {
+      ok: true,
+      run_id: 'run_model',
+      risk: { risk: 'low', reason: 'safe' },
+      decision: { decision: 'allow', reason: 'low risk' },
+      shadow_decision: { decision: 'allow', reason: 'low risk' },
+      content_hash: 'sha256:model',
+    },
+  }))
+
+  await runHook({
+    apiUrl: server.url,
+    input: { ...baseInput, model: 'gpt-5-codex' },
+  })
+  await server.close()
+
+  const decide = server.requests.find((r) => r.url === '/v2/governance/decide')
+  assert.ok(decide, 'decide call captured')
+  assert.equal(decide.body.agent_id, 'codex')
+  assert.equal(
+    decide.body.agent_model, 'gpt-5-codex',
+    'agent_model should reflect hookInput.model, not the agent id',
+  )
+})
+
+test('agent_model falls back to agent id when hookInput.model is missing', async () => {
+  clearState()
+  const server = await startMockServer(() => ({
+    status: 200,
+    body: {
+      ok: true,
+      run_id: 'run_no_model',
+      risk: { risk: 'low', reason: 'safe' },
+      decision: { decision: 'allow', reason: 'low risk' },
+      shadow_decision: { decision: 'allow', reason: 'low risk' },
+      content_hash: 'sha256:nomodel',
+    },
+  }))
+
+  const inputNoModel = { ...baseInput }
+  delete inputNoModel.model
+  await runHook({ apiUrl: server.url, input: inputNoModel })
+  await server.close()
+
+  const decide = server.requests.find((r) => r.url === '/v2/governance/decide')
+  assert.ok(decide, 'decide call captured')
+  assert.equal(
+    decide.body.agent_model, 'codex',
+    'agent_model should fall back to "codex" when hookInput.model is absent',
+  )
+})

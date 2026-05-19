@@ -25,7 +25,6 @@
     "hooks/",
     "scripts/",
     ".mcp.json",
-    "assets/",
     "README.md",
     "LICENSE"
   ],

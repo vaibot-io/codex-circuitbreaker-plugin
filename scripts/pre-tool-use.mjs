@@ -341,6 +341,13 @@ async function main() {
   const toolInput = hookInput.tool_input ?? {}
   const sessionId = hookInput.session_id ?? `cdx-${Date.now()}`
   const toolUseId = hookInput.tool_use_id ?? null
+  // agent_model is the actual LLM model Codex is using this turn (e.g.
+  // "gpt-5-codex"). Falls back to the agent identity when the hook
+  // doesn't carry a `model` field (older Codex builds; non-turn-scoped
+  // events). Used by V2 for per-model analytics + receipt attribution.
+  const agentModel = typeof hookInput.model === 'string' && hookInput.model
+    ? hookInput.model
+    : AGENT_ID
 
   // Skip governance for the governance tools themselves (avoid recursion).
   // Codex MCP naming: mcp__<server>__<tool>. The hooks.json matcher *should*
@@ -376,7 +383,7 @@ async function main() {
   const body = {
     session_id: sessionId,
     agent_id: AGENT_ID,
-    agent_model: AGENT_ID,
+    agent_model: agentModel,
     tool: toolName,
     workspace_dir: process.cwd(),
     intent: { command, target, cwd },
