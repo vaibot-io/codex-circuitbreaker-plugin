@@ -26,32 +26,25 @@ Codex pulls the marketplace, presents the install dialog, you confirm. Plugin la
 
 After install, restart your Codex session so it picks up the new hook config and MCP server registration.
 
-## Recommended Codex config
-
-For best UX, set Codex's approval policy to `on-request` so VAIBot's `approval_required` decisions trigger Codex's native approval prompt:
-
-```toml
-# ~/.codex/config.toml
-approval_policy = "on-request"
-```
-
-If you have `approval_policy = "never"`, Codex auto-approves all tool calls — VAIBot's flagging will still produce a receipt and a stderr warning, but no inline prompt fires. Approve from the dashboard instead.
-
 ## What you see at runtime
 
 **Allowed tool** — passes through silently. A receipt is recorded in the background.
 
-**Approval required** — VAIBot writes a flag message to stderr and to Codex's `systemMessage` channel:
+**Approval required (enforce mode)** — VAIBot **blocks** the tool call via `permissionDecision: "deny"` and surfaces actionable approval instructions in the deny reason. Codex shows the deny inline to the agent and the user:
 
 ```
-VAIBot: VAIBot flagged this Bash call as elevated risk — outbound network call.
-        content_hash: sha256:a3f9c1...
-        Approving here will record your decision in the VAIBot audit chain.
+VAIBot blocked this Bash call — high risk: outbound network call
+content_hash: sha256:a3f9c1…
+
+To approve and retry, do ONE of:
+  • Open https://www.vaibot.io/verify/decision/sha256%3Aa3f9c1…
+  • Run: vaibot approve sha256:a3f9c1…
+
+After approving, ask the agent to retry the same action — the
+plugin will short-circuit on the cached approval and allow it.
 ```
 
-If your `approval_policy` is `on-request` or `untrusted`, Codex's native approval prompt fires alongside the message. Approving lets the action run; the receipt is closed as approved on next `PostToolUse`. Denying leaves the receipt to be swept and closed as denied by the next hook (`Stop` or the next `PreToolUse`).
-
-If you later approve the same action from the dashboard, retrying executes it automatically — VAIBot caches an approval pointer keyed on `(tool, command, cwd)`.
+The receipt is recorded as `blocked_until_approved`. When you approve out-of-band (dashboard or `vaibot approve <hash>` CLI) and then ask the agent to retry the same intent, the plugin reads its cached approval pointer, sends `approved_content_hash` to the server, and the server short-circuits to `previously_approved: true`. The retry passes through as `allow` — the loop terminates.
 
 **Hard deny** — the tool is blocked outright via `permissionDecision: "deny"`. Codex shows the deny reason inline.
 
@@ -73,11 +66,13 @@ export VAIBOT_MODE=observe
 
 ### Enforce
 
-Tool calls are denied when the policy returns `deny`. Tool calls flagged `approval_required` are silent-allowed in the hook (Codex's `PreToolUse` doesn't support `ask`); pair with `approval_policy = "on-request"` for a native prompt.
+Tool calls are blocked when the policy returns `deny` or `approval_required`. `approval_required` blocks come with actionable approval instructions; once you approve out-of-band, asking the agent to retry the same action lets it through via the cached-approval short-circuit. `deny` is terminal — no retry path.
 
 ```bash
 export VAIBOT_MODE=enforce
 ```
+
+Note: VAIBot enforcement is independent of Codex's `approval_policy` setting. Whether you have `approval_policy = "never"`, `"on-request"`, or `"untrusted"`, VAIBot's verdict is what gates the tool call when `VAIBOT_MODE=enforce`. Setting `approval_policy = "on-request"` is no longer required for VAIBot to gate — it remains useful if you want Codex's native confirmation UI for non-VAIBot decisions.
 
 ## Slash commands — accessed via MCP tools
 
@@ -136,15 +131,17 @@ Codex CLI                      VAIBot API                    On-chain
     │                              ├─ buildReceipt()            │
     │                              ├─ anchorProvenance() ──────►│
     │◄─ allow / deny ─────────────┤                            │
-    │  (or silent-allow + msg)     │                            │
+    │  (deny carries approval URL  │                            │
+    │   when approval_required)    │                            │
     │                              │                            │
     ├─ [tool executes or blocked]  │                            │
-    │  [native prompt may fire     │                            │
-    │   for approval_required]     │                            │
+    │                              │                            │
+    │  ── retry after approval ──► │                            │
+    │  approved_content_hash echo  ├─ previously_approved=true  │
+    │◄─ allow ─────────────────────┤                            │
     │                              │                            │
     ├─ PostToolUse ───────────────►│                            │
-    │  (tool_response)             ├─ PATCH /approve            │
-    │                              ├─ finalizeReceipt()         │
+    │  (tool_response)             ├─ finalizeReceipt()         │
     │                              │                            │
     └─ Stop ──────────────────────►│  sweep deny pending        │
 ```
@@ -186,7 +183,7 @@ VAIBot is in early access. If you're installing this plugin now, you're among th
 
 ## Limitations (v0.1)
 
-- **`approval_required` UX**: Codex's `PreToolUse` doesn't support `ask` / escalate-to-human. The plugin silent-allows, emits a `systemMessage`, and depends on Codex's `approval_policy` setting to fire a native prompt. Set `approval_policy = "on-request"` for best behaviour.
+- **`approval_required` UX**: Codex's `PreToolUse` doesn't support `ask` / escalate-to-human, so the plugin blocks (`permissionDecision: "deny"`) with actionable approval instructions in the reason text. The user approves out-of-band (dashboard or `vaibot approve <hash>` CLI) and asks the agent to retry; the cached `approved_content_hash` short-circuits the next decide call to allow. Inline two-button native UX (à la Claude Code) is a v0.2 follow-up if Codex exposes a `PermissionRequest` injection point.
 - **Slash commands** are exposed as MCP tools rather than native `/vaibot <verb>` syntax (Codex doesn't support plugin-level slash commands as of 2026-05-08).
 - **Some tool calls aren't intercepted by Codex's hook system** — per the official docs, "WebSearch and other non-shell tools are not intercepted." Codex governance is strong but not bulletproof; the same caveat applies to all hook-based agent governance.
 

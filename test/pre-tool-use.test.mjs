@@ -135,7 +135,7 @@ test('enforce + deny → permissionDecision: "deny" with reason', async () => {
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /destructive/)
 })
 
-test('enforce + approval_required → silent allow + systemMessage with VAIBot flag text', async () => {
+test('enforce + approval_required → deny with actionable approval instructions', async () => {
   clearState()
   const server = await startMockServer((req) => {
     if (req.url === '/v2/governance/decide') {
@@ -151,6 +151,9 @@ test('enforce + approval_required → silent allow + systemMessage with VAIBot f
         },
       }
     }
+    if (req.url?.startsWith('/v2/governance/finalize/')) {
+      return { status: 200, body: { ok: true } }
+    }
     return null
   })
 
@@ -162,14 +165,94 @@ test('enforce + approval_required → silent allow + systemMessage with VAIBot f
 
   assert.equal(code, 0)
   const out = JSON.parse(stdout)
-  // No permissionDecision (silent allow)
-  assert.equal(out.hookSpecificOutput, undefined)
-  // systemMessage carries the VAIBot flag text
-  assert.match(out.systemMessage, /VAIBot flagged this Bash call as high risk/)
-  assert.match(out.systemMessage, /outbound network call/)
-  assert.match(out.systemMessage, /content_hash: sha256:askhash/)
-  // Stderr also carries the message
-  assert.match(stderr, /VAIBot:.*outbound network call/)
+  // Enforce: deny with actionable reason — not silent allow.
+  assert.equal(out.hookSpecificOutput.hookEventName, 'PreToolUse')
+  assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
+  const denyReason = out.hookSpecificOutput.permissionDecisionReason
+  assert.match(denyReason, /VAIBot blocked this Bash call/)
+  assert.match(denyReason, /high risk/)
+  assert.match(denyReason, /outbound network call/)
+  assert.match(denyReason, /content_hash: sha256:askhash/)
+  // Approval path: at least one approve route must be surfaced.
+  assert.match(denyReason, /vaibot\.io\/verify\/decision\//)
+  assert.match(denyReason, /vaibot approve sha256:askhash/)
+  // Retry instruction so the user knows the action will succeed after approval.
+  assert.match(denyReason, /retry/i)
+  // Stderr mirrors the message for the operator.
+  assert.match(stderr, /VAIBot blocked/)
+  // Finalize was called with blocked_until_approved so the receipt chain is accurate.
+  const finalize = server.requests.find((r) => r.url === '/v2/governance/finalize/run_ask')
+  assert.ok(finalize, 'expected finalize call for run_ask')
+  assert.equal(finalize.body.outcome, 'blocked_until_approved')
+})
+
+test('enforce + approval_required → retry after approval short-circuits to allow (terminating loop)', async () => {
+  clearState()
+  // First call: server returns approval_required, plugin denies + writes pending pointer.
+  const server1 = await startMockServer((req) => {
+    if (req.url === '/v2/governance/decide') {
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          run_id: 'run_retry_1',
+          risk: { risk: 'high', reason: 'outbound network' },
+          decision: { decision: 'approval_required', reason: 'needs approval' },
+          shadow_decision: { decision: 'approval_required', reason: 'needs approval' },
+          content_hash: 'sha256:retryhash',
+        },
+      }
+    }
+    if (req.url?.startsWith('/v2/governance/finalize/')) {
+      return { status: 200, body: { ok: true } }
+    }
+    return null
+  })
+
+  const denyResult = await runHook({
+    apiUrl: server1.url,
+    input: { ...baseInput, tool_input: { command: 'curl https://example.com' } },
+  })
+  await server1.close()
+  assert.equal(JSON.parse(denyResult.stdout).hookSpecificOutput.permissionDecision, 'deny')
+
+  // Second call (the retry, after user approves out-of-band): server sees the
+  // plugin pass approved_content_hash from the saved pointer, re-verifies
+  // intent, and returns previously_approved=true. Plugin coerces to allow.
+  const server2 = await startMockServer((req) => {
+    if (req.url === '/v2/governance/decide') {
+      // Assert the plugin DID send approved_content_hash on retry.
+      assert.equal(
+        req.body.approved_content_hash, 'sha256:retryhash',
+        'plugin must echo the saved pending approval hash on retry',
+      )
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          run_id: 'run_retry_2',
+          risk: { risk: 'high', reason: 'outbound network' },
+          // Server still says approval_required (raw shadow), but flags
+          // previously_approved → plugin treats as allow.
+          decision: { decision: 'approval_required', reason: 'needs approval' },
+          shadow_decision: { decision: 'approval_required', reason: 'needs approval' },
+          previously_approved: true,
+          content_hash: 'sha256:retryhash',
+        },
+      }
+    }
+    return null
+  })
+
+  const allowResult = await runHook({
+    apiUrl: server2.url,
+    input: { ...baseInput, tool_input: { command: 'curl https://example.com' } },
+  })
+  await server2.close()
+
+  // Allow path: empty stdout (omitting permissionDecision = allow per Codex spec).
+  assert.equal(allowResult.code, 0)
+  assert.equal(allowResult.stdout.trim(), '')
 })
 
 test('observe mode + approval_required → silent allow + stderr verdict only', async () => {

@@ -4,10 +4,14 @@
  *
  * Reads tool result from stdin (JSON), finds the matching run state from
  * pre-tool-use, and calls the VAIBot finalize endpoint to close the receipt.
- * Also resolves any approval_required state — if the tool actually executed
- * after pre-tool-use silent-allowed an elevated-risk intent, that means the
- * user (or Codex's approval mode) approved it; we PATCH /approve on the
- * receipt before finalizing.
+ *
+ * In the v0.1 enforce flow, approval_required intents are DENIED by
+ * pre-tool-use, so the tool doesn't execute and PostToolUse doesn't fire
+ * for the blocked attempt. On retry after out-of-band approval, the
+ * server returns previously_approved=true and pre-tool-use saves runState
+ * with `approval_required: false` — so the opportunistic PATCH /approve
+ * branch below is mostly defensive (it would fire only if some other
+ * code path saved an approval_required runState that subsequently ran).
  *
  * Environment variables:
  *   VAIBOT_API_URL    — base URL of the VAIBot v2 API (default: https://api.vaibot.io)
@@ -117,11 +121,14 @@ async function main() {
     process.exit(0)
   }
 
-  // PostToolUse firing after a silent-allowed approval_required means the
-  // tool actually ran — Codex's native approval flow (or "never" auto-approve)
-  // let it through. PATCH /approve on the receipt so its approval_status
-  // doesn't stay `pending` forever. (If user denied, PostToolUse never fires
-  // and the sweep in pre-tool-use or stop will PATCH /deny instead.)
+  // Defensive: if a runState somehow reaches PostToolUse with
+  // approval_required still true (e.g. legacy entries from a prior plugin
+  // version, or a future code path that saves the flag), PATCH /approve
+  // so the receipt's approval_status doesn't stay pending forever. In the
+  // current enforce flow this branch is effectively unreachable — pre-tool-
+  // use denies approval_required intents, so the tool doesn't execute and
+  // PostToolUse doesn't fire. Retries with previously_approved=true save
+  // runState with approval_required=false.
   if (runState.approval_required && runState.content_hash) {
     try {
       await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(runState.content_hash)}/approve`, {

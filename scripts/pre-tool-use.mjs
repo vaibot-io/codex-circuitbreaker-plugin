@@ -13,13 +13,19 @@
  *
  * Codex-specific behaviour vs the claudecode plugin:
  *  - Codex's PreToolUse does NOT support an "ask" / "escalate-to-human" return.
- *    For approval_required policy outcomes we silent-allow and emit a
- *    systemMessage with the VAIBot flag text. The user's Codex approval_policy
- *    setting determines whether Codex fires its own native prompt around it.
- *  - For BEST UX, README recommends users set approval_policy = "on-request"
- *    in ~/.codex/config.toml so elevated-risk tools always pause for confirm.
- *  - PostToolUse / Stop hooks handle approve/deny resolution the same way
- *    claudecode does — sweep pending state, PATCH /approve or /deny.
+ *    For approval_required outcomes (in enforce mode) the plugin DENIES with
+ *    actionable instructions (dashboard URL + `vaibot approve` CLI command).
+ *    The receipt is left in "blocked_until_approved" state. When the user
+ *    approves out-of-band and asks the agent to retry, the saved pending-
+ *    approval pointer + approved_content_hash short-circuit lets the retry
+ *    pass without re-tripping the deny — the loop terminates.
+ *  - In observe mode the plugin still allows (observe is log-only by design).
+ *  - The previous behaviour was silent-allow + systemMessage, which depended
+ *    on the user's separate Codex `approval_policy` setting to actually pause
+ *    execution. That defeated enforce mode whenever `approval_policy=never`.
+ *  - PostToolUse / Stop hooks still sweep pending state (PATCH /approve when
+ *    a previously-approval-required call eventually runs after approval;
+ *    PATCH /deny when the turn ends with the receipt still pending).
  *
  * Environment variables:
  *   VAIBOT_API_URL    — base URL of the VAIBot v2 API (default: https://api.vaibot.io)
@@ -479,32 +485,52 @@ async function main() {
       const contentHash = data.content_hash ?? ''
       const riskLabel = data.risk?.risk ?? 'elevated'
 
-      // Save pointer so a retry of this exact intent can short-circuit if the
-      // user later approves from the dashboard.
+      // Save pointer so the retry of this exact intent can short-circuit. On
+      // the next PreToolUse for the same (tool, command, cwd), the plugin
+      // reads this pointer, sends approved_content_hash, and the server
+      // returns previously_approved=true → decision coerced to allow.
       if (contentHash) writePendingApproval(toolName, command, cwd, contentHash)
 
-      // Codex's PreToolUse can't escalate-to-human like Claude Code's 'ask'.
-      // We silent-allow and emit a systemMessage with the VAIBot flag text.
-      // Whether Codex shows it inline depends on the user's approval_policy:
-      //   - approval_policy = "on-request": Codex fires its native prompt; our
-      //     systemMessage may render alongside it (verify in implementation
-      //     spike — see plan).
-      //   - approval_policy = "never": Codex auto-approves. The receipt is
-      //     left in pending state; PostToolUse PATCHes /approve when the tool
-      //     completes. README recommends "on-request" for elevated-risk gating.
+      // Enforce mode: actually block. Codex's PreToolUse can't escalate-to-
+      // human like Claude Code's 'ask', so the plugin issues a deny with
+      // actionable approval instructions in the reason text. The agent sees
+      // the deny and stops; the user approves out-of-band (dashboard or CLI);
+      // when the agent retries, the saved pending-approval pointer triggers
+      // the approved_content_hash short-circuit → server returns
+      // previously_approved=true → plugin allows. The replay terminates.
       //
-      // The action proceeds in either case; the receipt stays pending until
-      // PostToolUse or sweep resolves it.
-      const message =
-        `VAIBot flagged this ${toolName} call as ${riskLabel} risk — ${reason}\n` +
-        `content_hash: ${contentHash}\n` +
-        `Approving here will record your decision in the VAIBot audit chain.`
+      // This is the corrected behaviour vs the previous silent-allow, which
+      // depended on the user's separate Codex approval_policy setting and
+      // therefore failed to enforce when approval_policy = "never". The
+      // whole point of enforce mode is to stop unsafe actions; we now do.
+      const approveUrl = contentHash
+        ? `${DASHBOARD_URL}/verify/decision/${encodeURIComponent(contentHash)}`
+        : `${DASHBOARD_URL}/dashboard`
+      const denyReason =
+        `VAIBot blocked this ${toolName} call — ${riskLabel} risk: ${reason}\n` +
+        (contentHash ? `content_hash: ${contentHash}\n` : '') +
+        `\nTo approve and retry, do ONE of:\n` +
+        `  • Open ${approveUrl}\n` +
+        (contentHash ? `  • Run: vaibot approve ${contentHash}\n` : '') +
+        `\nAfter approving, ask the agent to retry the same action — the\n` +
+        `plugin will short-circuit on the cached approval and allow it.`
+
+      // Record the pre-approval state on the receipt chain so the audit
+      // trail reflects "blocked pending user decision" rather than dangling.
+      await bestEffortFinalize(
+        data.run_id, 'blocked_until_approved',
+        `Plugin enforced: approval_required pending user decision`,
+      )
 
       const output = {
-        systemMessage: message,
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: denyReason,
+        },
       }
       process.stdout.write(JSON.stringify(output))
-      process.stderr.write(`VAIBot: ${message}\n`)
+      process.stderr.write(`VAIBot: ${denyReason}\n`)
       process.exit(0)
     }
 
