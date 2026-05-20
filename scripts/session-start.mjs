@@ -49,6 +49,18 @@ const MODE = process.env.VAIBOT_MODE ?? 'observe'
 const savedCreds = loadSavedCredentials()
 const API_KEY = process.env.VAIBOT_API_KEY ?? savedCreds?.api_key ?? ''
 
+// Read the user's Codex approval_policy (informational only — we never write
+// it). A regex read avoids pulling in a TOML parser, consistent with how
+// postinstall.mjs manipulates config.toml. Returns the policy string or null
+// if unset / unreadable.
+function readApprovalPolicy() {
+  try {
+    const cfg = readFileSync(join(homedir(), '.codex', 'config.toml'), 'utf-8')
+    const m = /^\s*approval_policy\s*=\s*["']?([a-z_-]+)["']?/m.exec(cfg)
+    return m ? m[1] : null
+  } catch { return null }
+}
+
 // Stable per-machine. NO cwd in the formula — matches pre-tool-use.mjs.
 function getFingerprint() {
   const user = userInfo().username
@@ -106,6 +118,18 @@ async function main() {
   // Mode banner — stderr so it doesn't pollute stdout (which Codex treats
   // as developer context).
   process.stderr.write(`VAIBot: governance active (mode=${MODE}). https://www.vaibot.io\n`)
+
+  // Heads-up for enforce-mode users who have approval_policy = "never": they
+  // might assume nothing gates their tool calls. VAIBot enforces independently
+  // of Codex's approval_policy (we deny in PreToolUse before Codex's native
+  // flow ever runs), so reassure them — without touching their config.
+  if (MODE === 'enforce' && readApprovalPolicy() === 'never') {
+    process.stderr.write(
+      `VAIBot: your Codex approval_policy is "never", but VAIBot enforce gates ` +
+      `independently — flagged actions are blocked regardless of that setting. ` +
+      `Approve blocked actions at ${DASHBOARD_URL}/dashboard or with 'vaibot approve <hash>'.\n`,
+    )
+  }
 
   process.exit(0)
 }
