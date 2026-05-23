@@ -20,34 +20,23 @@
  */
 
 import { createHash } from 'node:crypto'
-import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { homedir, hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
+import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from './lib/creds.mjs'
 
-const CREDS_DIR = join(homedir(), '.vaibot')
-const CREDS_FILE = join(CREDS_DIR, 'credentials.json')
-
-function loadSavedCredentials() {
-  try {
-    if (existsSync(CREDS_FILE)) return JSON.parse(readFileSync(CREDS_FILE, 'utf-8'))
-  } catch { /* ignore corrupt file */ }
-  return null
-}
-
-function saveCredentials(creds) {
-  try {
-    mkdirSync(CREDS_DIR, { recursive: true, mode: 0o700 })
-    writeFileSync(CREDS_FILE, JSON.stringify(creds, null, 2), { mode: 0o600 })
-  } catch { /* best-effort */ }
-}
-
-const API_URL = (process.env.VAIBOT_API_URL ?? 'https://api.vaibot.io').replace(/\/+$/, '')
 const DASHBOARD_URL = (process.env.VAIBOT_DASHBOARD_URL ?? 'https://www.vaibot.io').replace(/\/+$/, '')
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 const MODE = process.env.VAIBOT_MODE ?? 'observe'
 
-const savedCreds = loadSavedCredentials()
-const API_KEY = process.env.VAIBOT_API_KEY ?? savedCreds?.api_key ?? ''
+// Env-namespaced credential store (see pre-tool-use.mjs). Migrate any legacy
+// flat file, then resolve env + key + base URL for this session.
+migrateFileIfNeeded()
+const resolved = resolveCredentials()
+const ENV = resolved.env
+const API_URL = resolved.apiBaseUrl
+const CREDS_FILE = credsPath()
+const API_KEY = resolved.apiKey ?? ''
 
 // Read the user's Codex approval_policy (informational only — we never write
 // it). A regex read avoids pulling in a TOML parser, consistent with how
@@ -79,15 +68,7 @@ async function bootstrap() {
   if (!res.ok) return null
   const data = await res.json()
   if (data.api_key) {
-    saveCredentials({
-      api_key: data.api_key,
-      account_id: data.account_id,
-      user_id: data.user_id,
-      wallet_address: data.wallet_address,
-      wallet_network: data.wallet_network,
-      api_url: API_URL,
-      bootstrapped_at: new Date().toISOString(),
-    })
+    saveCredsForEnv(ENV, { api_key: data.api_key, wallet_address: data.wallet_address })
     const claimUrl = `${DASHBOARD_URL}/claim?api_key=${encodeURIComponent(data.api_key)}`
     process.stderr.write(
       `VAIBot: account provisioned. Credentials saved to ${CREDS_FILE}\n` +
@@ -117,7 +98,7 @@ async function main() {
 
   // Mode banner — stderr so it doesn't pollute stdout (which Codex treats
   // as developer context).
-  process.stderr.write(`VAIBot: governance active (mode=${MODE}). https://www.vaibot.io\n`)
+  process.stderr.write(`VAIBot: governance active (mode=${MODE}, env=${ENV}). https://www.vaibot.io\n`)
 
   // Heads-up for enforce-mode users who have approval_policy = "never": they
   // might assume nothing gates their tool calls. VAIBot enforces independently
