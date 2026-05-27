@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { rmSync, existsSync, mkdtempSync } from 'node:fs'
+import { rmSync, existsSync, mkdtempSync, mkdirSync, readdirSync, statSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -443,6 +443,59 @@ test('agent_model is read from hookInput.model (not hardcoded)', async () => {
     decide.body.agent_model, 'gpt-5-codex',
     'agent_model should reflect hookInput.model, not the agent id',
   )
+})
+
+test('STATE_DIR is created 0o700 and saved state files are 0o600 (no metadata leak on shared hosts)', async () => {
+  clearState()
+  const server = await startMockServer(() => ({
+    status: 200,
+    body: {
+      ok: true,
+      run_id: 'run_perms',
+      risk: { risk: 'low', reason: 'safe' },
+      decision: { decision: 'allow', reason: 'ok' },
+      shadow_decision: { decision: 'allow', reason: 'ok' },
+      content_hash: 'sha256:perms',
+    },
+  }))
+  await runHook({ apiUrl: server.url, input: baseInput })
+  await server.close()
+
+  const dirMode = statSync(STATE_DIR).mode & 0o777
+  assert.equal(dirMode, 0o700, `STATE_DIR should be 0o700, got 0o${dirMode.toString(8)}`)
+
+  const stateFiles = readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))
+  assert.ok(stateFiles.length > 0, 'expected at least one state file')
+  for (const f of stateFiles) {
+    const m = statSync(join(STATE_DIR, f)).mode & 0o777
+    assert.equal(m, 0o600, `state file ${f} should be 0o600, got 0o${m.toString(8)}`)
+  }
+})
+
+test('STATE_DIR perms are tightened on the fly when a legacy 0o755 dir already exists', async () => {
+  // Simulates an upgrade from an older plugin version that created STATE_DIR
+  // with default (umask-respecting) perms. The current code must chmod down to
+  // 0o700 on next touch — otherwise the leak persists across plugin upgrades.
+  clearState()
+  mkdirSync(STATE_DIR, { recursive: true })
+  chmodSync(STATE_DIR, 0o755)
+  assert.equal(statSync(STATE_DIR).mode & 0o777, 0o755, 'precondition: legacy 0o755 dir')
+
+  const server = await startMockServer(() => ({
+    status: 200,
+    body: {
+      ok: true,
+      run_id: 'run_chmod',
+      risk: { risk: 'low', reason: 'safe' },
+      decision: { decision: 'allow', reason: 'ok' },
+      shadow_decision: { decision: 'allow', reason: 'ok' },
+      content_hash: 'sha256:chmod',
+    },
+  }))
+  await runHook({ apiUrl: server.url, input: baseInput })
+  await server.close()
+
+  assert.equal(statSync(STATE_DIR).mode & 0o777, 0o700, 'legacy dir should be tightened to 0o700')
 })
 
 test('agent_model falls back to agent id when hookInput.model is missing', async () => {
