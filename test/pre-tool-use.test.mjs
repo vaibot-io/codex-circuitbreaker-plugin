@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { rmSync, existsSync, mkdtempSync, mkdirSync, readdirSync, statSync, chmodSync } from 'node:fs'
+import { rmSync, existsSync, mkdtempSync, mkdirSync, readdirSync, statSync, chmodSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,11 +36,20 @@ function startMockServer(handler) {
   })
 }
 
-function runHook({ apiUrl, mode = 'enforce', input, env = {}, cwd }) {
+function runHook({ apiUrl, mode = 'enforce', input, env = {}, cwd, sharedHome }) {
+  // Per-call fake HOME (and TMPDIR-equivalent state dir) so breaker state and
+  // run-state in $TMPDIR/vaibot-codex/ don't pollute either the user's real
+  // ~/.vaibot or other parallel test files. Tests that need state to persist
+  // across calls (e.g. retry-after-approval) pass `sharedHome` to reuse one.
+  const fakeHome = sharedHome ?? mkdtempSync(join(tmpdir(), 'vaibot-codex-test-home-'))
+  const fakeTmp = join(fakeHome, 'tmp')
+  try { mkdirSync(fakeTmp, { recursive: true }) } catch {}
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
       env: {
         ...process.env,
+        HOME: fakeHome,
+        TMPDIR: fakeTmp,
         VAIBOT_API_URL: apiUrl,
         VAIBOT_API_KEY: 'test-key',
         VAIBOT_MODE: mode,
@@ -55,8 +64,14 @@ function runHook({ apiUrl, mode = 'enforce', input, env = {}, cwd }) {
     let stderr = ''
     child.stdout.on('data', (c) => { stdout += c })
     child.stderr.on('data', (c) => { stderr += c })
-    child.on('error', reject)
-    child.on('exit', (code) => resolve({ code, stdout, stderr }))
+    child.on('error', (err) => {
+      if (!sharedHome) { try { rmSync(fakeHome, { recursive: true, force: true }) } catch {} }
+      reject(err)
+    })
+    child.on('exit', (code) => {
+      if (!sharedHome) { try { rmSync(fakeHome, { recursive: true, force: true }) } catch {} }
+      resolve({ code, stdout, stderr })
+    })
     child.stdin.write(JSON.stringify(input))
     child.stdin.end()
   })
@@ -187,7 +202,9 @@ test('enforce + approval_required → deny with actionable approval instructions
 })
 
 test('enforce + approval_required → retry after approval short-circuits to allow (terminating loop)', async () => {
-  clearState()
+  // Both calls share one fake HOME (and thus one TMPDIR + STATE_DIR) so the
+  // pending-approval pointer written by call 1 is readable by call 2.
+  const sharedHome = mkdtempSync(join(tmpdir(), 'vaibot-codex-retry-home-'))
   // First call: server returns approval_required, plugin denies + writes pending pointer.
   const server1 = await startMockServer((req) => {
     if (req.url === '/v2/governance/decide') {
@@ -212,6 +229,7 @@ test('enforce + approval_required → retry after approval short-circuits to all
   const denyResult = await runHook({
     apiUrl: server1.url,
     input: { ...baseInput, tool_input: { command: 'curl https://example.com' } },
+    sharedHome,
   })
   await server1.close()
   assert.equal(JSON.parse(denyResult.stdout).hookSpecificOutput.permissionDecision, 'deny')
@@ -247,8 +265,10 @@ test('enforce + approval_required → retry after approval short-circuits to all
   const allowResult = await runHook({
     apiUrl: server2.url,
     input: { ...baseInput, tool_input: { command: 'curl https://example.com' } },
+    sharedHome,
   })
   await server2.close()
+  try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
 
   // Allow path: empty stdout (omitting permissionDecision = allow per Codex spec).
   assert.equal(allowResult.code, 0)
@@ -446,29 +466,36 @@ test('agent_model is read from hookInput.model (not hardcoded)', async () => {
 })
 
 test('STATE_DIR is created 0o700 and saved state files are 0o600 (no metadata leak on shared hosts)', async () => {
-  clearState()
-  const server = await startMockServer(() => ({
-    status: 200,
-    body: {
-      ok: true,
-      run_id: 'run_perms',
-      risk: { risk: 'low', reason: 'safe' },
-      decision: { decision: 'allow', reason: 'ok' },
-      shadow_decision: { decision: 'allow', reason: 'ok' },
-      content_hash: 'sha256:perms',
-    },
-  }))
-  await runHook({ apiUrl: server.url, input: baseInput })
-  await server.close()
+  // sharedHome → spawn uses TMPDIR=<sharedHome>/tmp, so the hook's STATE_DIR
+  // is <sharedHome>/tmp/vaibot-codex/ and we can inspect it after the call.
+  const sharedHome = mkdtempSync(join(tmpdir(), 'vaibot-codex-perms-'))
+  const stateDir = join(sharedHome, 'tmp', 'vaibot-codex')
+  try {
+    const server = await startMockServer(() => ({
+      status: 200,
+      body: {
+        ok: true,
+        run_id: 'run_perms',
+        risk: { risk: 'low', reason: 'safe' },
+        decision: { decision: 'allow', reason: 'ok' },
+        shadow_decision: { decision: 'allow', reason: 'ok' },
+        content_hash: 'sha256:perms',
+      },
+    }))
+    await runHook({ apiUrl: server.url, input: baseInput, sharedHome })
+    await server.close()
 
-  const dirMode = statSync(STATE_DIR).mode & 0o777
-  assert.equal(dirMode, 0o700, `STATE_DIR should be 0o700, got 0o${dirMode.toString(8)}`)
+    const dirMode = statSync(stateDir).mode & 0o777
+    assert.equal(dirMode, 0o700, `STATE_DIR should be 0o700, got 0o${dirMode.toString(8)}`)
 
-  const stateFiles = readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))
-  assert.ok(stateFiles.length > 0, 'expected at least one state file')
-  for (const f of stateFiles) {
-    const m = statSync(join(STATE_DIR, f)).mode & 0o777
-    assert.equal(m, 0o600, `state file ${f} should be 0o600, got 0o${m.toString(8)}`)
+    const stateFiles = readdirSync(stateDir).filter((f) => f.endsWith('.json'))
+    assert.ok(stateFiles.length > 0, 'expected at least one state file')
+    for (const f of stateFiles) {
+      const m = statSync(join(stateDir, f)).mode & 0o777
+      assert.equal(m, 0o600, `state file ${f} should be 0o600, got 0o${m.toString(8)}`)
+    }
+  } finally {
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
   }
 })
 
@@ -476,26 +503,31 @@ test('STATE_DIR perms are tightened on the fly when a legacy 0o755 dir already e
   // Simulates an upgrade from an older plugin version that created STATE_DIR
   // with default (umask-respecting) perms. The current code must chmod down to
   // 0o700 on next touch — otherwise the leak persists across plugin upgrades.
-  clearState()
-  mkdirSync(STATE_DIR, { recursive: true })
-  chmodSync(STATE_DIR, 0o755)
-  assert.equal(statSync(STATE_DIR).mode & 0o777, 0o755, 'precondition: legacy 0o755 dir')
+  const sharedHome = mkdtempSync(join(tmpdir(), 'vaibot-codex-perms-legacy-'))
+  const stateDir = join(sharedHome, 'tmp', 'vaibot-codex')
+  try {
+    mkdirSync(stateDir, { recursive: true })
+    chmodSync(stateDir, 0o755)
+    assert.equal(statSync(stateDir).mode & 0o777, 0o755, 'precondition: legacy 0o755 dir')
 
-  const server = await startMockServer(() => ({
-    status: 200,
-    body: {
-      ok: true,
-      run_id: 'run_chmod',
-      risk: { risk: 'low', reason: 'safe' },
-      decision: { decision: 'allow', reason: 'ok' },
-      shadow_decision: { decision: 'allow', reason: 'ok' },
-      content_hash: 'sha256:chmod',
-    },
-  }))
-  await runHook({ apiUrl: server.url, input: baseInput })
-  await server.close()
+    const server = await startMockServer(() => ({
+      status: 200,
+      body: {
+        ok: true,
+        run_id: 'run_chmod',
+        risk: { risk: 'low', reason: 'safe' },
+        decision: { decision: 'allow', reason: 'ok' },
+        shadow_decision: { decision: 'allow', reason: 'ok' },
+        content_hash: 'sha256:chmod',
+      },
+    }))
+    await runHook({ apiUrl: server.url, input: baseInput, sharedHome })
+    await server.close()
 
-  assert.equal(statSync(STATE_DIR).mode & 0o777, 0o700, 'legacy dir should be tightened to 0o700')
+    assert.equal(statSync(stateDir).mode & 0o777, 0o700, 'legacy dir should be tightened to 0o700')
+  } finally {
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
 })
 
 test('agent_model falls back to agent id when hookInput.model is missing', async () => {
