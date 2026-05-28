@@ -1,0 +1,20 @@
+{
+  "name": "vaibot-codex-circuitbreaker-marketplace",
+  "interface": {
+    "displayName": "VAIbot Governance — Codex"
+  },
+  "plugins": [
+    {
+      "name": "vaibot-codex-circuitbreaker",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Security"
+    }
+  ]
+}

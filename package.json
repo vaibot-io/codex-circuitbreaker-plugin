@@ -21,6 +21,7 @@
   "type": "module",
   "private": false,
   "files": [
+    ".agents/",
     ".codex-plugin/",
     "hooks/",
     "scripts/",
