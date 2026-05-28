@@ -174,7 +174,7 @@ function applyBreakerTrippedDecision(breaker, toolName) {
   const denyReason =
     `VAIBot circuit breaker tripped — V2 governance API failed ${BREAKER_CFG.failureThreshold}+ times recently.\n` +
     `${toolName} is not on the breaker allowlist; blocking until cooldown (${cooldownSec}s) or API recovery.\n` +
-    `To override: add ${toolName} to VAIBOT_BREAKER_ALLOWLIST, set VAIBOT_BREAKER_DISABLED=true, or wait.`
+    `To override: add ${toolName} to VAIBOT_BREAKER_ALLOWLIST, or wait.`
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
