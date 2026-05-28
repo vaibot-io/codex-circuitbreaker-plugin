@@ -18,11 +18,18 @@ The MCP server gives the agent a way to query and interact with VAIBot. This plu
 
 ## Quick start
 
+Install in two steps from inside the Codex CLI:
+
 ```bash
+# 1. Register the marketplace (clones the repo into Codex's marketplace cache)
 codex plugin marketplace add vaibot-io/codex-circuitbreaker-plugin
+
+# 2. Install the plugin from that marketplace via Codex's plugin picker:
+#    Run `codex plugin` to open the plugin directory, choose `vaibot-codex`,
+#    and install `vaibot-codex-circuitbreaker`.
 ```
 
-Codex pulls the marketplace, presents the install dialog, you confirm. Plugin lands at `~/.codex/plugins/cache/vaibot-io/vaibot-codex-circuitbreaker/0.1.0/`. On first tool call (or session start) the plugin auto-bootstraps a free-tier VAIBot account using a machine fingerprint and saves credentials to `~/.vaibot/credentials.json`.
+The plugin lands at `~/.codex/plugins/cache/vaibot-io/vaibot-codex-circuitbreaker/<version>/` (e.g. `0.1.2/`). On first tool call (or session start) it auto-bootstraps a free-tier VAIBot account using a machine fingerprint and saves credentials to `~/.vaibot/credentials.json`.
 
 After install, restart your Codex session so it picks up the new hook config and MCP server registration.
 
