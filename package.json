@@ -20,6 +20,9 @@
   ],
   "type": "module",
   "private": false,
+  "dependencies": {
+    "@vaibot/guard": "workspace:*"
+  },
   "files": [
     ".agents/",
     ".codex-plugin/",
