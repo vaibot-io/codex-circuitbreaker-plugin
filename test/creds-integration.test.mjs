@@ -69,8 +69,10 @@ function runHook({ credsDir, env, key, mode = 'observe' }) {
 
 const readStore = (dir) => JSON.parse(readFileSync(join(dir, 'credentials.json'), 'utf-8'))
 const freshDir = () => mkdtempSync(join(tmpdir(), 'vbsmoke-'))
-const decideOf = () => requests.find((r) => r.path === '/v2/governance/decide')
 const didBootstrap = () => requests.some((r) => r.path === '/v2/bootstrap')
+// Note: in Direction A the resolved key is handed to the guard via guardEnv,
+// not carried on the decide call — so these tests assert creds resolution via
+// the on-disk store + bootstrap behavior, not a Bearer header on /decide.
 
 test('per-env bootstrap, no cross-env clobber, correct key per env', async () => {
   const dir = freshDir()
@@ -81,7 +83,6 @@ test('per-env bootstrap, no cross-env clobber, correct key per env', async () =>
     assert.equal(s.environments?.production?.api_key, 'vb_live_PROD')
     assert.equal(s.environments?.production?.wallet_address, '0xabc')
     assert.equal(s.environments?.production?.wallet_network, undefined, 'wallet_network must not be stored')
-    assert.equal(decideOf()?.auth, 'Bearer vb_live_PROD')
 
     requests = []; bootstrapKey = 'vb_stg_STG'; walletNetwork = 'base-sepolia'
     await runHook({ credsDir: dir, env: 'staging' })
@@ -89,12 +90,10 @@ test('per-env bootstrap, no cross-env clobber, correct key per env', async () =>
     assert.equal(s.environments?.staging?.api_key, 'vb_stg_STG')
     assert.equal(s.environments?.production?.api_key, 'vb_live_PROD', 'staging bootstrap clobbered production')
     assert.equal(s.active_env, 'staging')
-    assert.equal(decideOf()?.auth, 'Bearer vb_stg_STG')
 
     requests = []; bootstrapKey = 'vb_live_SHOULD_NOT_BE_USED'
     await runHook({ credsDir: dir, env: 'production' })
     assert.equal(didBootstrap(), false, 'should reuse stored key, not re-bootstrap')
-    assert.equal(decideOf()?.auth, 'Bearer vb_live_PROD')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -107,7 +106,6 @@ test('prefix guard: a cross-env key is ignored, warned, and re-bootstrapped', as
     const { err } = await runHook({ credsDir: dir, env: 'production', key: 'vb_stg_WRONGENV' })
     assert.match(err, /prefix doesn't match env="production"/)
     assert.equal(readStore(dir).environments?.production?.api_key, 'vb_live_FRESH')
-    assert.equal(decideOf()?.auth, 'Bearer vb_live_FRESH')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -128,7 +126,6 @@ test('legacy v1 flat credentials.json migrates to v2 in place', async () => {
     assert.ok(existsSync(join(dir, 'credentials.json.bak')), '.bak should be written')
     assert.equal(JSON.parse(readFileSync(join(dir, 'credentials.json.bak'), 'utf-8')).account_id, '0xold')
     assert.equal(didBootstrap(), false, 'legacy key should be reused, not re-bootstrapped')
-    assert.equal(decideOf()?.auth, 'Bearer vb_live_OLD')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

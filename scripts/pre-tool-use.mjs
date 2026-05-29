@@ -52,6 +52,11 @@ import {
   DEFAULT_COOLDOWN_MS,
 } from './lib/circuit-breaker.mjs'
 import { classify, VERDICT } from './lib/classifier.mjs'
+import { ensureGuardDefault } from './lib/guard-launch.mjs'
+import { decideViaGuard } from './lib/guard-client.mjs'
+import { createRequire } from 'node:module'
+
+const nodeRequire = createRequire(import.meta.url)
 
 // ── Credentials + environment ────────────────────────────────────────────────
 // One env-namespaced store (~/.vaibot/credentials.json), via the vendored copy
@@ -132,10 +137,6 @@ function saveBreakerSnapshot(snap) {
   } catch {
     /* best-effort — state is an optimization, not correctness-critical */
   }
-}
-
-function isTransientHttpFailure(status) {
-  return status >= 500 && status < 600
 }
 
 // Emits a deny / allow when the breaker is tripped. Returns nothing; caller
@@ -296,14 +297,8 @@ async function sweepPendingApprovals({ excludeToolUseId } = {}) {
 
     try { unlinkSync(path) } catch { continue }  // lost the race
 
-    try {
-      await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(entry.content_hash)}/deny`, {
-        method: 'PATCH',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      })
-    } catch { /* best-effort */ }
-
+    // Guard approvals self-expire server-side; the sweep only cleans stale
+    // local run-state (no network call).
     if (entry.intent_key) {
       try { unlinkSync(join(PENDING_DIR, `${entry.intent_key}.json`)) } catch {}
     }
@@ -383,18 +378,6 @@ async function maybeNudgeUnclaimed(sessionId) {
   } catch { /* best-effort */ }
 }
 
-async function bestEffortFinalize(runId, outcome, summary) {
-  if (!runId) return
-  try {
-    await fetch(`${API_URL}/v2/governance/finalize/${encodeURIComponent(runId)}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
-      body: JSON.stringify({ outcome, result: { summary } }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    })
-  } catch { /* non-blocking */ }
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function clamp(str, max = 2000) {
@@ -419,14 +402,6 @@ function extractCommand(toolName, input) {
   return undefined
 }
 
-function extractTarget(toolName, input) {
-  if (!input) return undefined
-  if (input.path) return input.path
-  if (input.file_path) return input.file_path
-  if (input.url) return input.url
-  return undefined
-}
-
 function extractCwd(toolName, input) {
   if (!input) return undefined
   if (input.cwd) return input.cwd
@@ -436,6 +411,33 @@ function extractCwd(toolName, input) {
 function stableHash(obj) {
   const json = JSON.stringify(obj, Object.keys(obj).sort())
   return createHash('sha256').update(json).digest('hex').slice(0, 16)
+}
+
+// ── Guard resolution (Direction A) ───────────────────────────────────────────
+// Resolve the local guard to route the decision through. If VAIBOT_GUARD_BASE_URL
+// is set, use it directly (external guard / test seam); otherwise discover-or-
+// launch @vaibot/guard via ensureGuardDefault, handing it the resolved creds so
+// it can prove receipts. Returns null when no guard can be reached/launched —
+// the caller treats that as a transient outage (breaker + classifier fallback).
+async function resolveGuardTarget(cwd) {
+  const baseUrl = process.env.VAIBOT_GUARD_BASE_URL
+  if (baseUrl) {
+    try {
+      const u = new URL(baseUrl)
+      return { host: u.hostname, port: Number(u.port) || 39111, token: process.env.VAIBOT_GUARD_TOKEN || '' }
+    } catch { /* fall through to launch */ }
+  }
+  let guardScript
+  try {
+    guardScript = nodeRequire.resolve('@vaibot/guard/service')
+  } catch {
+    return null
+  }
+  const r = await ensureGuardDefault({
+    guardScript,
+    guardEnv: { VAIBOT_API_URL: API_URL, VAIBOT_API_KEY: API_KEY, VAIBOT_WORKSPACE: cwd || process.cwd() },
+  })
+  return r && r.ok ? { host: r.host, port: r.port, token: r.token } : null
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -459,13 +461,6 @@ async function main() {
   const toolInput = hookInput.tool_input ?? {}
   const sessionId = hookInput.session_id ?? `cdx-${Date.now()}`
   const toolUseId = hookInput.tool_use_id ?? null
-  // agent_model is the actual LLM model Codex is using this turn (e.g.
-  // "gpt-5-codex"). Falls back to the agent identity when the hook
-  // doesn't carry a `model` field (older Codex builds; non-turn-scoped
-  // events). Used by V2 for per-model analytics + receipt attribution.
-  const agentModel = typeof hookInput.model === 'string' && hookInput.model
-    ? hookInput.model
-    : AGENT_ID
 
   // Skip governance for the governance tools themselves (avoid recursion).
   // Codex MCP naming: mcp__<server>__<tool>. The hooks.json matcher *should*
@@ -506,25 +501,12 @@ async function main() {
   }
 
   const command = extractCommand(toolName, toolInput)
-  const target = extractTarget(toolName, toolInput)
   const cwd = extractCwd(toolName, toolInput)
   const toolCallId = toolUseId ?? stableHash({ toolName, ...toolInput, ts: Date.now() })
 
-  const body = {
-    session_id: sessionId,
-    agent_id: AGENT_ID,
-    agent_model: agentModel,
-    tool: toolName,
-    workspace_dir: process.cwd(),
-    intent: { command, target, cwd },
-  }
-
   // Retry awareness: if we previously got approval_required for this exact
-  // intent and saved a pointer, send it. Server re-verifies intent.
+  // intent and saved a pointer, present it to the guard for redemption.
   const pending = readPendingApproval(toolName, command, cwd)
-  if (pending?.content_hash) {
-    body.approved_content_hash = pending.content_hash
-  }
 
   if (process.env.VAIBOT_DEBUG === '1') {
     const ih = intentHash(toolName, command, cwd)
@@ -536,43 +518,55 @@ async function main() {
   }
 
   try {
-    const res = await fetch(`${API_URL}/v2/governance/decide`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${API_KEY}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    })
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => '')
-
-      // Breaker accounting: only 5xx counts as a transient failure. 401/403
-      // (auth) and other 4xx (verdicts / bad requests) do NOT trip the
-      // breaker — that would mask credential issues behind generic outage
-      // behavior and gate every classifier-ambiguous tool on a config bug.
-      if (isTransientHttpFailure(res.status)) {
-        breaker.recordFailure(`API ${res.status}`)
-        saveBreakerSnapshot(breaker.snapshot())
-        if (breaker.isTripped()) {
-          // This failure just tripped the breaker — apply local decision now.
-          applyBreakerTrippedDecision(breaker, toolName, toolInput)
-          process.exit(0)
-        }
-      }
-
+    // Direction A: route the decision through the local guard — it decides AND
+    // proves the receipt. On guard-unreachable, fall back to the breaker +
+    // classifier; a 4xx (e.g. 401) is a real response, not a transient outage.
+    const guard = await resolveGuardTarget(cwd)
+    if (!guard) {
+      breaker.recordFailure('guard unavailable')
+      saveBreakerSnapshot(breaker.snapshot())
+      if (breaker.isTripped()) { applyBreakerTrippedDecision(breaker, toolName, toolInput); process.exit(0) }
       if (FAIL_OPEN || MODE === 'observe') process.exit(0)
-      process.stderr.write(`VAIBot: governance API returned ${res.status}: ${text.slice(0, 200)}\n`)
+      process.stderr.write(`VAIBot: local guard unavailable and FAIL_OPEN=false — denying ${toolName}\n`)
       process.exit(2)
     }
 
-    const data = await res.json()
+    const result = await decideViaGuard(
+      guard,
+      { sessionId, toolName, params: toolInput, workspaceDir: cwd, approvalId: pending?.content_hash },
+      { timeoutMs: TIMEOUT_MS },
+    )
 
-    // API call succeeded — reset the breaker's failure window.
+    if (!result.ok) {
+      if (result.unreachable) {
+        breaker.recordFailure(`guard ${result.status ?? 'unreachable'}`)
+        saveBreakerSnapshot(breaker.snapshot())
+        if (breaker.isTripped()) { applyBreakerTrippedDecision(breaker, toolName, toolInput); process.exit(0) }
+        if (FAIL_OPEN || MODE === 'observe') process.exit(0)
+        process.stderr.write(`VAIBot: guard decide failed (${result.status ?? 'network'}) — denying ${toolName}\n`)
+        process.exit(2)
+      }
+      if (FAIL_OPEN || MODE === 'observe') process.exit(0)
+      process.stderr.write(`VAIBot: guard returned ${result.status} — denying ${toolName}\n`)
+      process.exit(2)
+    }
+
+    // Guard reachable → reset the breaker's failure window.
     breaker.recordSuccess()
     saveBreakerSnapshot(breaker.snapshot())
+
+    // Adapt the guard's decision into the shape the downstream consumes
+    // (approve → approval_required; the approvalId rides as content_hash).
+    const guardDecision = result.decision === 'approve' ? 'approval_required' : result.decision
+    const data = {
+      run_id: result.runId,
+      content_hash: result.approvalId ?? '',
+      receipt_id: null,
+      risk: result.risk && typeof result.risk === 'object' ? result.risk : { risk: result.risk ?? null },
+      decision: { decision: guardDecision, reason: result.reason },
+      shadow_decision: { decision: guardDecision, reason: result.reason },
+      previously_approved: !!pending?.content_hash && result.decision === 'allow',
+    }
 
     if (process.env.VAIBOT_DEBUG === '1') {
       process.stderr.write(
@@ -658,13 +652,6 @@ async function main() {
         `\nAfter approving, ask the agent to retry the same action — the\n` +
         `plugin will short-circuit on the cached approval and allow it.`
 
-      // Record the pre-approval state on the receipt chain so the audit
-      // trail reflects "blocked pending user decision" rather than dangling.
-      await bestEffortFinalize(
-        data.run_id, 'blocked_until_approved',
-        `Plugin enforced: approval_required pending user decision`,
-      )
-
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
@@ -680,7 +667,6 @@ async function main() {
     if (decision === 'deny') {
       const reason = rawReason ?? `Denied by policy for ${toolName}`
       clearPendingApproval(toolName, command, cwd)
-      await bestEffortFinalize(data.run_id, 'blocked', `Plugin enforced: deny`)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',

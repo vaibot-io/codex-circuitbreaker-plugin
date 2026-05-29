@@ -2,33 +2,36 @@
 /**
  * VAIBot Codex CLI PostToolUse hook.
  *
- * Reads tool result from stdin (JSON), finds the matching run state from
- * pre-tool-use, and calls the VAIBot finalize endpoint to close the receipt.
- *
- * In the v0.1 enforce flow, approval_required intents are DENIED by
- * pre-tool-use, so the tool doesn't execute and PostToolUse doesn't fire
- * for the blocked attempt. On retry after out-of-band approval, the
- * server returns previously_approved=true and pre-tool-use saves runState
- * with `approval_required: false` — so the opportunistic PATCH /approve
- * branch below is mostly defensive (it would fire only if some other
- * code path saved an approval_required runState that subsequently ran).
+ * Reads the tool result from stdin (JSON), finds the matching run state saved
+ * by pre-tool-use, and finalizes through the local VAIBot guard's
+ * /v1/finalize/tool (which proves the finalize receipt) to close the run.
  *
  * Environment variables:
- *   VAIBOT_API_URL    — base URL of the VAIBot v2 API (default: https://api.vaibot.io)
- *   VAIBOT_API_KEY    — Bearer token for the governance API
- *   VAIBOT_TIMEOUT_MS — request timeout in ms (default: 10000)
+ *   VAIBOT_GUARD_BASE_URL — override the local guard URL (else discovered from the lock file)
+ *   VAIBOT_GUARD_TOKEN    — bearer token for the local guard
+ *   VAIBOT_TIMEOUT_MS     — request timeout in ms (default: 10000)
  */
 
 import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resolveCredentials, credsPath } from './lib/creds.mjs'
+import { readLock } from './lib/guard-bootstrap.mjs'
 
-const CREDS_FILE = credsPath()
-const resolved = resolveCredentials()
-const API_URL = resolved.apiBaseUrl
-const API_KEY = resolved.apiKey ?? ''
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
+
+// Resolve the running guard to finalize against. pre-tool-use already launched
+// it (lock written) by the time PostToolUse fires; honour the env override if set.
+function resolveGuard() {
+  const baseUrl = process.env.VAIBOT_GUARD_BASE_URL
+  if (baseUrl) {
+    try {
+      const u = new URL(baseUrl)
+      return { host: u.hostname, port: Number(u.port) || 39111, token: process.env.VAIBOT_GUARD_TOKEN || '' }
+    } catch { /* fall through */ }
+  }
+  const lock = readLock()
+  return lock && lock.port ? { host: lock.host, port: lock.port, token: lock.token } : null
+}
 
 const STATE_DIR = join(tmpdir(), 'vaibot-codex')
 const MAX_STATE_AGE_MS = 5 * 60 * 1000 // 5 minutes
@@ -104,54 +107,31 @@ async function main() {
   const runState = findRunState(toolName, toolUseId)
   if (!runState?.run_id) process.exit(0)
 
-  if (!API_KEY) {
+  // Direction A: finalize through the local guard (it proves the finalize
+  // receipt). The guard recovers the session from the runId's stored context,
+  // so we don't need to carry session_id in run-state.
+  const guard = resolveGuard()
+  if (!guard) {
     process.stderr.write(
-      `VAIBot [finalize]: no API key — receipt ${runState.run_id} left unfinalized. ` +
-      `Set VAIBOT_API_KEY or ensure ${CREDS_FILE} is readable.\n`
+      `VAIBot [finalize]: no local guard reachable — run ${runState.run_id} left unfinalized.\n`
     )
     process.exit(0)
   }
 
-  // Defensive: if a runState somehow reaches PostToolUse with
-  // approval_required still true (e.g. legacy entries from a prior plugin
-  // version, or a future code path that saves the flag), PATCH /approve
-  // so the receipt's approval_status doesn't stay pending forever. In the
-  // current enforce flow this branch is effectively unreachable — pre-tool-
-  // use denies approval_required intents, so the tool doesn't execute and
-  // PostToolUse doesn't fire. Retries with previously_approved=true save
-  // runState with approval_required=false.
-  if (runState.approval_required && runState.content_hash) {
-    try {
-      await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(runState.content_hash)}/approve`, {
-        method: 'PATCH',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${API_KEY}`,
-        },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      })
-    } catch { /* best-effort — don't block finalize */ }
-  }
-
   const outcome = error ? 'blocked' : 'allowed'
-
-  const result = {}
+  const result = { outcome }
   if (typeof durationMs === 'number') result.duration_ms = durationMs
   if (error) result.error = String(error).slice(0, 2000)
-  const body = { outcome, ...(Object.keys(result).length > 0 ? { result } : {}) }
 
   try {
-    await fetch(`${API_URL}/v2/governance/finalize/${encodeURIComponent(runState.run_id)}`, {
+    await fetch(`http://${guard.host}:${guard.port}/v1/finalize/tool`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${API_KEY}`,
-      },
-      body: JSON.stringify(body),
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${guard.token}` },
+      body: JSON.stringify({ sessionId: 'codex', runId: runState.run_id, result }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })
   } catch {
-    // Best-effort finalization — don't block the session
+    // Best-effort finalization — don't block the session.
   }
 
   process.exit(0)

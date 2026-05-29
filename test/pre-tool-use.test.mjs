@@ -51,6 +51,8 @@ function runHook({ apiUrl, mode = 'enforce', input, env = {}, cwd, sharedHome })
         HOME: fakeHome,
         TMPDIR: fakeTmp,
         VAIBOT_API_URL: apiUrl,
+        VAIBOT_GUARD_BASE_URL: apiUrl,
+        VAIBOT_GUARD_TOKEN: 'test-guard-token',
         VAIBOT_API_KEY: 'test-key',
         VAIBOT_MODE: mode,
         VAIBOT_TIMEOUT_MS: '2000',
@@ -91,7 +93,7 @@ const baseInput = {
 test('enforce + allow → exit 0, empty stdout (silent allow)', async () => {
   clearState()
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -118,7 +120,7 @@ test('enforce + allow → exit 0, empty stdout (silent allow)', async () => {
 test('enforce + deny → permissionDecision: "deny" with reason', async () => {
   clearState()
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -153,16 +155,14 @@ test('enforce + deny → permissionDecision: "deny" with reason', async () => {
 test('enforce + approval_required → deny with actionable approval instructions', async () => {
   clearState()
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
           ok: true,
-          run_id: 'run_ask',
+          runId: 'run_ask',
           risk: { risk: 'high', reason: 'outbound network' },
-          decision: { decision: 'approval_required', reason: 'outbound network call' },
-          shadow_decision: { decision: 'approval_required', reason: 'outbound network call' },
-          content_hash: 'sha256:askhash',
+          decision: { decision: 'approve', reason: 'outbound network call', approvalId: 'appr_ask' },
         },
       }
     }
@@ -187,18 +187,14 @@ test('enforce + approval_required → deny with actionable approval instructions
   assert.match(denyReason, /VAIBot blocked this Bash call/)
   assert.match(denyReason, /high risk/)
   assert.match(denyReason, /outbound network call/)
-  assert.match(denyReason, /content_hash: sha256:askhash/)
+  assert.match(denyReason, /content_hash: appr_ask/)
   // Approval path: at least one approve route must be surfaced.
   assert.match(denyReason, /vaibot\.io\/verify\/decision\//)
-  assert.match(denyReason, /vaibot approve sha256:askhash/)
+  assert.match(denyReason, /vaibot approve appr_ask/)
   // Retry instruction so the user knows the action will succeed after approval.
   assert.match(denyReason, /retry/i)
   // Stderr mirrors the message for the operator.
   assert.match(stderr, /VAIBot blocked/)
-  // Finalize was called with blocked_until_approved so the receipt chain is accurate.
-  const finalize = server.requests.find((r) => r.url === '/v2/governance/finalize/run_ask')
-  assert.ok(finalize, 'expected finalize call for run_ask')
-  assert.equal(finalize.body.outcome, 'blocked_until_approved')
 })
 
 test('enforce + approval_required → retry after approval short-circuits to allow (terminating loop)', async () => {
@@ -207,16 +203,14 @@ test('enforce + approval_required → retry after approval short-circuits to all
   const sharedHome = mkdtempSync(join(tmpdir(), 'vaibot-codex-retry-home-'))
   // First call: server returns approval_required, plugin denies + writes pending pointer.
   const server1 = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
           ok: true,
-          run_id: 'run_retry_1',
+          runId: 'run_retry_1',
           risk: { risk: 'high', reason: 'outbound network' },
-          decision: { decision: 'approval_required', reason: 'needs approval' },
-          shadow_decision: { decision: 'approval_required', reason: 'needs approval' },
-          content_hash: 'sha256:retryhash',
+          decision: { decision: 'approve', reason: 'needs approval', approvalId: 'appr_retry' },
         },
       }
     }
@@ -238,24 +232,20 @@ test('enforce + approval_required → retry after approval short-circuits to all
   // plugin pass approved_content_hash from the saved pointer, re-verifies
   // intent, and returns previously_approved=true. Plugin coerces to allow.
   const server2 = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
-      // Assert the plugin DID send approved_content_hash on retry.
+    if (req.url === '/v1/decide/tool') {
+      // Assert the plugin presents the saved approvalId to the guard on retry.
       assert.equal(
-        req.body.approved_content_hash, 'sha256:retryhash',
-        'plugin must echo the saved pending approval hash on retry',
+        req.body.approval?.approvalId, 'appr_retry',
+        'plugin must present the saved approvalId on retry',
       )
+      // The guard redeems the approval and returns allow.
       return {
         status: 200,
         body: {
           ok: true,
-          run_id: 'run_retry_2',
+          runId: 'run_retry_2',
           risk: { risk: 'high', reason: 'outbound network' },
-          // Server still says approval_required (raw shadow), but flags
-          // previously_approved → plugin treats as allow.
-          decision: { decision: 'approval_required', reason: 'needs approval' },
-          shadow_decision: { decision: 'approval_required', reason: 'needs approval' },
-          previously_approved: true,
-          content_hash: 'sha256:retryhash',
+          decision: { decision: 'allow', reason: 'approved by user' },
         },
       }
     }
@@ -278,16 +268,14 @@ test('enforce + approval_required → retry after approval short-circuits to all
 test('observe mode + approval_required → silent allow + stderr verdict only', async () => {
   clearState()
   const server = await startMockServer((req) => {
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
           ok: true,
-          run_id: 'run_obs',
+          runId: 'run_obs',
           risk: { risk: 'high', reason: 'safe-ish' },
-          decision: { decision: 'allow', reason: 'observe-coerced' },
-          shadow_decision: { decision: 'approval_required', reason: 'would-have-asked' },
-          content_hash: 'sha256:obs',
+          decision: { decision: 'approve', reason: 'would-have-asked' },
         },
       }
     }
@@ -346,7 +334,7 @@ test('API 5xx in enforce mode without FAIL_OPEN → exit 2 (deny)', async () => 
   await server.close()
 
   assert.equal(code, 2, 'fail-closed by default')
-  assert.match(stderr, /governance API returned 500/)
+  assert.match(stderr, /guard decide failed \(500\)/)
 })
 
 test('regression (Change 1): bootstrap fingerprint is cwd-independent', async () => {
@@ -372,7 +360,7 @@ test('regression (Change 1): bootstrap fingerprint is cwd-independent', async ()
         },
       }
     }
-    if (req.url === '/v2/governance/decide') {
+    if (req.url === '/v1/decide/tool') {
       return {
         status: 200,
         body: {
@@ -434,35 +422,6 @@ test('mode=observe + API 5xx → exit 0 (observe always allows)', async () => {
   await server.close()
 
   assert.equal(code, 0)
-})
-
-test('agent_model is read from hookInput.model (not hardcoded)', async () => {
-  clearState()
-  const server = await startMockServer(() => ({
-    status: 200,
-    body: {
-      ok: true,
-      run_id: 'run_model',
-      risk: { risk: 'low', reason: 'safe' },
-      decision: { decision: 'allow', reason: 'low risk' },
-      shadow_decision: { decision: 'allow', reason: 'low risk' },
-      content_hash: 'sha256:model',
-    },
-  }))
-
-  await runHook({
-    apiUrl: server.url,
-    input: { ...baseInput, model: 'gpt-5-codex' },
-  })
-  await server.close()
-
-  const decide = server.requests.find((r) => r.url === '/v2/governance/decide')
-  assert.ok(decide, 'decide call captured')
-  assert.equal(decide.body.agent_id, 'codex')
-  assert.equal(
-    decide.body.agent_model, 'gpt-5-codex',
-    'agent_model should reflect hookInput.model, not the agent id',
-  )
 })
 
 test('STATE_DIR is created 0o700 and saved state files are 0o600 (no metadata leak on shared hosts)', async () => {
@@ -528,31 +487,4 @@ test('STATE_DIR perms are tightened on the fly when a legacy 0o755 dir already e
   } finally {
     try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
   }
-})
-
-test('agent_model falls back to agent id when hookInput.model is missing', async () => {
-  clearState()
-  const server = await startMockServer(() => ({
-    status: 200,
-    body: {
-      ok: true,
-      run_id: 'run_no_model',
-      risk: { risk: 'low', reason: 'safe' },
-      decision: { decision: 'allow', reason: 'low risk' },
-      shadow_decision: { decision: 'allow', reason: 'low risk' },
-      content_hash: 'sha256:nomodel',
-    },
-  }))
-
-  const inputNoModel = { ...baseInput }
-  delete inputNoModel.model
-  await runHook({ apiUrl: server.url, input: inputNoModel })
-  await server.close()
-
-  const decide = server.requests.find((r) => r.url === '/v2/governance/decide')
-  assert.ok(decide, 'decide call captured')
-  assert.equal(
-    decide.body.agent_model, 'codex',
-    'agent_model should fall back to "codex" when hookInput.model is absent',
-  )
 })
