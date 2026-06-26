@@ -1,0 +1,6 @@
+# Never commit node_modules — Codex copies plugin files verbatim and silently drops
+# symlinks, so the pnpm workspace symlink at node_modules/@vaibot/guard must never
+# reach the distributed repo. The guard ships as real files under vendor/ instead.
+node_modules/
+*.tgz
+.vaibot-guard/

@@ -23,7 +23,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { homedir, hostname, userInfo } from 'node:os'
 import { join } from 'node:path'
-import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from '@vaibot/guard/creds'
+import { resolveCredentials, saveCredsForEnv, migrateFileIfNeeded, credsPath } from '../vendor/vaibot-guard/scripts/lib/creds.mjs'
 
 const DASHBOARD_URL = (process.env.VAIBOT_DASHBOARD_URL ?? 'https://www.vaibot.io').replace(/\/+$/, '')
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000

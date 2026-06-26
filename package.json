@@ -20,7 +20,7 @@
   ],
   "type": "module",
   "private": false,
-  "dependencies": {
+  "devDependencies": {
     "@vaibot/guard": "workspace:*"
   },
   "files": [
@@ -28,6 +28,7 @@
     ".codex-plugin/",
     "hooks/",
     "scripts/",
+    "vendor/",
     ".mcp.json",
     "README.md",
     "LICENSE"
