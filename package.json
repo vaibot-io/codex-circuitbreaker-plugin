@@ -16,7 +16,8 @@
     "vaibot",
     "hooks",
     "audit",
-    "provenance"
+    "provenance",
+    "guardrails"
   ],
   "type": "module",
   "private": false,

@@ -24,6 +24,18 @@
         ]
       }
     ],
+    "PermissionRequest": [
+      {
+        "matcher": "^(?!mcp__vaibot__).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CODEX_PLUGIN_ROOT/scripts/permission-request.mjs\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "^(?!mcp__vaibot__).*",

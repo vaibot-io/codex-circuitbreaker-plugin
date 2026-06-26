@@ -53,6 +53,8 @@ plugin will short-circuit on the cached approval and allow it.
 
 The receipt is recorded as `blocked_until_approved`. When you approve out-of-band (dashboard or `vaibot approve <hash>` CLI) and then ask the agent to retry the same intent, the plugin reads its cached approval pointer, sends `approved_content_hash` to the server, and the server short-circuits to `previously_approved: true`. The retry passes through as `allow` — the loop terminates.
 
+**Native approval prompts (`PermissionRequest`)** — when Codex itself is about to ask you to approve an action (a sandbox/network escalation, an `on-request` confirmation), VAIBot's `PermissionRequest` hook routes that prompt through the guard: it **auto-approves** what the guard allows (so you aren't asked about safe actions), **auto-denies** what the guard denies, and **declines** for anything that needs a human — letting Codex show its normal approval prompt. This layers on top of the `PreToolUse` floor; `PreToolUse` still independently blocks hard-denies and `approval_required` actions regardless of your `approval_policy`.
+
 **Hard deny** — the tool is blocked outright via `permissionDecision: "deny"`. Codex shows the deny reason inline.
 
 **In observe mode** — all tools proceed, but the policy verdict is logged to stderr:
@@ -93,6 +95,7 @@ Codex CLI doesn't currently support custom slash commands at the plugin layer (v
 | `/vaibot deny <hash>` | "deny vaibot hash <hash>" | `mcp__vaibot__deny` |
 | `/vaibot recent` | "show recent vaibot receipts" | `mcp__vaibot__recent` |
 | `/vaibot policy` | "show my vaibot policy" | `mcp__vaibot__policy` |
+| `/vaibot policy request <p>` | "request a vaibot policy denying <pattern>" | `mcp__vaibot__policy_request` |
 
 When Codex exposes a slash-command extension API in a future version, native registrations will be added in a minor version bump.
 
@@ -215,8 +218,8 @@ VAIBot is in early access. If you're installing this plugin now, you're among th
 
 ## Limitations (v0.1)
 
-- **`approval_required` UX**: Codex's `PreToolUse` doesn't support `ask` / escalate-to-human, so the plugin blocks (`permissionDecision: "deny"`) with actionable approval instructions in the reason text. The user approves out-of-band (dashboard or `vaibot approve <hash>` CLI) and asks the agent to retry; the cached `approved_content_hash` short-circuits the next decide call to allow. Inline two-button native UX (à la Claude Code) is a v0.2 follow-up if Codex exposes a `PermissionRequest` injection point.
+- **`approval_required` UX**: the mandatory `PreToolUse` floor blocks `approval_required` actions (`permissionDecision: "deny"`) with actionable approval instructions, because it can't rely on your `approval_policy` to surface a prompt. The user approves out-of-band (dashboard or `vaibot approve <hash>` CLI) and asks the agent to retry; the cached `approved_content_hash` short-circuits the next decide call to allow. Separately, the `PermissionRequest` hook now drives Codex's **native** approval prompts when they fire — auto-approving guard-safe actions, auto-denying guard-dangerous ones, and deferring genuine asks to you. (Codex's `PreToolUse` itself still has no `ask`/escalate return — `permissionDecision: "ask"` is parsed but unsupported — so the floor denies rather than asks.)
 - **Slash commands** are exposed as MCP tools rather than native `/vaibot <verb>` syntax (Codex doesn't support plugin-level slash commands as of 2026-05-08).
 - **Some tool calls aren't intercepted by Codex's hook system** — per the official docs, "WebSearch and other non-shell tools are not intercepted." Codex governance is strong but not bulletproof; the same caveat applies to all hook-based agent governance.
 
-A v0.2 release will add native slash commands and `PermissionRequest`-based approval injection if/when Codex's plugin surface supports it.
+A v0.2 release will add native `/vaibot <verb>` slash commands if/when Codex's plugin surface supports plugin-level slash commands.
