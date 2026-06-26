@@ -2,7 +2,7 @@
 
 ## `vaibot-guard/` — a committed, real-file copy of `@vaibot/guard`
 
-**Current version: `1.0.1`** (the same version the `vaibot` CLI installs globally — keep them in lockstep).
+**Current version: `1.0.2`** (the same version the `vaibot` CLI installs globally — keep them in lockstep).
 
 ### Why this is vendored (and not a normal dependency)
 
