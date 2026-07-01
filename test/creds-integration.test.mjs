@@ -54,8 +54,11 @@ function runHook({ credsDir, env, key, mode = 'observe' }) {
     for (const k of Object.keys(clean)) if (k.startsWith('VAIBOT_')) delete clean[k]
     // Point the hook's tmp state dir (tmpdir()/vaibot-codex) at our isolated
     // credsDir so concurrent test files don't share global tmp run-state.
+    // These are bootstrap/migration cases (mostly no api_key), so the account base
+    // can't come from a file slot — the slim store drops a keyless env record — and
+    // must use the VAIBOT_GOVERNANCE_URL override. The prod cases need the §5 flag.
     const child = spawn(process.execPath, [HOOK], {
-      env: { ...clean, TMPDIR: credsDir, VAIBOT_CREDS_DIR: credsDir, VAIBOT_API_URL: API_URL, VAIBOT_ENV: env, VAIBOT_MODE: mode, VAIBOT_TIMEOUT_MS: '3000', ...(key ? { VAIBOT_API_KEY: key } : {}) },
+      env: { ...clean, TMPDIR: credsDir, VAIBOT_CREDS_DIR: credsDir, VAIBOT_API_URL: API_URL, VAIBOT_GOVERNANCE_URL: API_URL, VAIBOT_ALLOW_URL_OVERRIDE: '1', VAIBOT_ENV: env, VAIBOT_MODE: mode, VAIBOT_TIMEOUT_MS: '3000', ...(key ? { VAIBOT_API_KEY: key } : {}) },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     let out = '', err = ''
@@ -111,7 +114,7 @@ test('prefix guard: a cross-env key is ignored, warned, and re-bootstrapped', as
   }
 })
 
-test('legacy v1 flat credentials.json migrates to v2 in place', async () => {
+test('legacy v1 flat credentials.json migrates to v3 in place', async () => {
   const dir = freshDir(); mkdirSync(dir, { recursive: true })
   try {
     const legacy = { api_key: 'vb_live_OLD', api_url: 'https://api.vaibot.io', account_id: '0xold', user_id: 'uold', wallet_address: '0xold', wallet_network: 'base', bootstrapped_at: '2026-01-01T00:00:00Z' }
@@ -119,7 +122,7 @@ test('legacy v1 flat credentials.json migrates to v2 in place', async () => {
     requests = []; bootstrapKey = 'vb_live_SHOULD_NOT_BOOTSTRAP'
     await runHook({ credsDir: dir, env: 'production' })
     const s = readStore(dir)
-    assert.equal(s.version, 2)
+    assert.equal(s.version, 3)
     assert.equal(s.environments?.production?.api_key, 'vb_live_OLD')
     assert.equal(s.environments?.production?.account_id, undefined)
     assert.equal(s.environments?.production?.api_url, undefined)

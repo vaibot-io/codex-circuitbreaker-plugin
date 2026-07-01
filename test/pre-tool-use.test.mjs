@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { rmSync, existsSync, mkdtempSync, mkdirSync, readdirSync, statSync, chmodSync, readFileSync } from 'node:fs'
+import { rmSync, existsSync, mkdtempSync, mkdirSync, readdirSync, statSync, chmodSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,6 +36,26 @@ function startMockServer(handler) {
   })
 }
 
+// v3 creds resolve the account base from the SINGLE credentials.json governance
+// slot. Seed that file so the hook reads the mock URL from the file (no env
+// override). migrateStore keeps an env record only if it carries an api_key, so
+// this is used for the with-key path; keyless bootstrap uses an env override.
+function seedCredsUrl(homeDir, { env = 'staging', url, apiKey } = {}) {
+  const dir = join(homeDir, '.vaibot')
+  const file = join(dir, 'credentials.json')
+  let store
+  try { store = JSON.parse(readFileSync(file, 'utf-8')) } catch { store = { version: 3, active_env: env, environments: {} } }
+  store.version = 3
+  store.active_env = store.active_env ?? env
+  store.environments = store.environments ?? {}
+  store.environments[env] = store.environments[env] ?? {}
+  store.environments[env].governance = { url }
+  store.environments[env].provenance = { url }
+  if (apiKey) store.environments[env].api_key = apiKey
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(file, JSON.stringify(store))
+}
+
 function runHook({ apiUrl, mode = 'enforce', input, env = {}, cwd, sharedHome }) {
   // Per-call fake HOME (and TMPDIR-equivalent state dir) so breaker state and
   // run-state in $TMPDIR/vaibot-codex/ don't pollute either the user's real
@@ -44,6 +64,14 @@ function runHook({ apiUrl, mode = 'enforce', input, env = {}, cwd, sharedHome })
   const fakeHome = sharedHome ?? mkdtempSync(join(tmpdir(), 'vaibot-codex-test-home-'))
   const fakeTmp = join(fakeHome, 'tmp')
   try { mkdirSync(fakeTmp, { recursive: true }) } catch {}
+  // With a key, resolve the account base from the seeded credentials.json (single
+  // store). Bootstrap (no key) can't persist a keyless URL in the slim store, so it
+  // uses the env override (staging ⇒ no §5 prod flag).
+  const effHome = env.HOME ?? fakeHome
+  const effKey = 'VAIBOT_API_KEY' in env ? env.VAIBOT_API_KEY : 'test-key'
+  const overrideEnv = {}
+  if (effKey) seedCredsUrl(effHome, { url: apiUrl, apiKey: effKey })
+  else { overrideEnv.VAIBOT_GOVERNANCE_URL = apiUrl; overrideEnv.VAIBOT_ENV = 'staging' }
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
       env: {
@@ -57,6 +85,7 @@ function runHook({ apiUrl, mode = 'enforce', input, env = {}, cwd, sharedHome })
         VAIBOT_MODE: mode,
         VAIBOT_TIMEOUT_MS: '2000',
         VAIBOT_DASHBOARD_URL: 'https://www.vaibot.io',
+        ...overrideEnv,
         ...env,
       },
       cwd,
