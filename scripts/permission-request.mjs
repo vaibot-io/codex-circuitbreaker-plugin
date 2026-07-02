@@ -34,7 +34,7 @@ import { decideViaGuard, guardDecisionToVerdict } from '../vendor/vaibot-guard/s
 const nodeRequire = createRequire(import.meta.url)
 
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
-const MODE = process.env.VAIBOT_MODE ?? 'observe'
+const MODE = process.env.VAIBOT_MODE ?? 'enforce'
 
 // Credentials are resolved (not bootstrapped) here — PreToolUse runs first and
 // owns auto-bootstrap. We just hand whatever key exists to the guard so it can

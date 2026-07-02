@@ -82,7 +82,11 @@ const DASHBOARD_URL = (process.env.VAIBOT_DASHBOARD_URL ?? 'https://www.vaibot.i
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 const AGENT_ID = 'codex'
 const FAIL_OPEN = process.env.VAIBOT_FAIL_OPEN === 'true'
-const MODE = process.env.VAIBOT_MODE ?? 'observe'
+// Default posture is ENFORCE. When the guard is reachable it publishes the
+// account's effective_mode (which wins); this default only governs the guard-DOWN
+// fallback, where enforce degrades *conditionally* (see applyGuardDownDecision)
+// instead of blanket-denying a fresh install.
+const MODE = process.env.VAIBOT_MODE ?? 'enforce'
 
 // ── Circuit breaker ────────────────────────────────────────────────────────
 // Local fallback. Sliding-window failure counter: N transient API errors
@@ -185,6 +189,53 @@ function emitBreakerDeny(reason) {
     },
   }))
   process.stderr.write(`VAIBot: ${reason}\n`)
+}
+
+// Cold start = a machine where the guard has never written a rendezvous lock.
+// Conditions the guard-unreachable degrade: a fresh install (no lock) may still be
+// bringing the daemon up, so it degrades to the local floor instead of bricking;
+// an established install whose lock is present but now unreachable is treated as
+// possible tampering and stays fail-closed. Same-user best-effort — a deleted lock
+// can spoof cold-start, which is why guard-down still audits + alerts either way.
+function isColdStart() {
+  try {
+    return !existsSync(join(homedir(), '.vaibot', 'guard', 'guard.json'))
+  } catch {
+    return false // unreadable → do NOT assume fresh; fail toward fail-closed
+  }
+}
+
+// Guard unreachable under enforce → conditioned degrade (NOT a blanket allow):
+//  * the catastrophic floor is enforced LOCALLY in every case (classifier
+//    DANGEROUS → deny), so rm -rf /, guard self-protection, fork bombs, etc. are
+//    blocked even with no daemon running;
+//  * cold start (fresh install, no rendezvous lock) → allow-with-audit so the box
+//    can bootstrap the daemon;
+//  * established install (lock present) but daemon gone and un-relaunchable →
+//    possible tampering → stay fail-closed (deny) + alert.
+function applyGuardDownDecision(toolName, toolInput) {
+  const verdict = classify({ tool: toolName, input: toolInput })
+  const dangerous = verdict.verdictHint === VERDICT.DENY
+  // Cold start (fresh install, no rendezvous lock) + non-catastrophic → degrade to
+  // allow-with-audit so the box can bring the daemon up. Dangerous still denies.
+  if (isColdStart() && !dangerous) {
+    process.stderr.write(
+      `VAIBot [degraded]: guard not up yet (fresh install) — ${toolName} allowed with audit; ` +
+      `catastrophic floor still enforced. If the guard never comes up, see ~/.vaibot/guard/launch.log.\n`,
+    )
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
+    }))
+    process.exit(0)
+  }
+  // Catastrophic floor (any install) OR an established install whose guard is gone
+  // and un-relaunchable (possible tampering) → fail-closed hard deny (exit 2).
+  process.stderr.write(
+    dangerous
+      ? `VAIBot: denying ${toolName} — catastrophic floor (${verdict.reasons?.[0] ?? 'dangerous action'}), enforced with no daemon.\n`
+      : `VAIBot: denying ${toolName} — guard ran here but is now unreachable and un-relaunchable (possible tampering). See ~/.vaibot/guard/launch.log.\n`,
+  )
+  process.exit(2)
 }
 
 // ── Fingerprint ────────────────────────────────────────────────────────────
@@ -533,8 +584,8 @@ async function main() {
       saveBreakerSnapshot(breaker.snapshot())
       if (breaker.isTripped()) { applyBreakerTrippedDecision(breaker, toolName, toolInput); process.exit(0) }
       if (FAIL_OPEN || MODE === 'observe') process.exit(0)
-      process.stderr.write(`VAIBot: local guard unavailable and FAIL_OPEN=false — denying ${toolName}\n`)
-      process.exit(2)
+      applyGuardDownDecision(toolName, toolInput)
+      process.exit(0)
     }
 
     const result = await decideViaGuard(
