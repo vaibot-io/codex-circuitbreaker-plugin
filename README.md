@@ -65,20 +65,22 @@ VAIBot [observe]: Bash would be approval_required — outbound network call.
 
 ## Modes
 
-### Observe (default)
+The **effective mode is resolved by the guard from your account** and wins whenever the guard is reachable. `VAIBOT_MODE` is the **local fallback**, used only before the guard has answered — and it defaults to **`enforce`**.
 
-All tool calls are allowed. The governance verdict is logged to stderr but never enforced. Use this to audit your agent's behaviour before enabling enforcement.
-
-```bash
-export VAIBOT_MODE=observe
-```
-
-### Enforce
+### Enforce (default)
 
 Tool calls are blocked when the policy returns `deny` or `approval_required`. `approval_required` blocks come with actionable approval instructions; once you approve out-of-band, asking the agent to retry the same action lets it through via the cached-approval short-circuit. `deny` is terminal — no retry path.
 
 ```bash
 export VAIBOT_MODE=enforce
+```
+
+### Observe
+
+All tool calls proceed; the governance verdict is logged to stderr but never enforced (**except the catastrophic floor**). Use it to audit your agent — and as the **escape hatch** if enforcement ever blocks you (see [Recovery / escape hatch](#recovery--escape-hatch)).
+
+```bash
+export VAIBOT_MODE=observe
 ```
 
 Note: VAIBot enforcement is independent of Codex's `approval_policy` setting. Whether you have `approval_policy = "never"`, `"on-request"`, or `"untrusted"`, VAIBot's verdict is what gates the tool call when `VAIBOT_MODE=enforce`. Setting `approval_policy = "on-request"` is no longer required for VAIBot to gate — it remains useful if you want Codex's native confirmation UI for non-VAIBot decisions.
@@ -113,6 +115,25 @@ VAIBot: account exists but API key not found locally.
 ```
 
 To claim your account and approve from the dashboard, visit the URL printed on first run.
+
+### No API key never bricks the agent
+
+A missing or unprovisionable key does **not** fail-closed. If `/v2/bootstrap` can't mint one (the account already exists and the local key was lost, or the endpoint is unreachable), the plugin **governs locally** with the built-in classifier: **safe** tools run, the **catastrophic floor** still denies, and **risky** tools are held with a `vaibot login` hint (Codex can't escalate-to-human, so it can't prompt while keyless). Safe tools running is enough to recover yourself.
+
+## Recovery / escape hatch
+
+If enforcement ever blocks you and you need out **now**, run Codex with the local observe fallback:
+
+```bash
+# Instant escape — allows all but the catastrophic floor. Does NOT weaken
+# enforcement once the guard is reachable and you have a key again.
+export VAIBOT_MODE=observe
+```
+
+To restore full (server-backed) governance, get a key back — any one:
+- `vaibot login` (allowed — it's a safe tool),
+- copy your key from **https://www.vaibot.io** → `export VAIBOT_API_KEY=vb_…`,
+- or check `~/.vaibot/credentials.json`.
 
 ## Configuration
 
