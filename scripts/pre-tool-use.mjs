@@ -238,6 +238,26 @@ function applyGuardDownDecision(toolName, toolInput) {
   process.exit(2)
 }
 
+// No usable API key (bootstrap can't provision one — the account already exists but the
+// local key was lost, or the endpoint is unreachable) → do NOT brick. Govern LOCALLY via
+// the classifier so safe work + `vaibot login` recovery proceed while the catastrophic
+// floor still holds. Codex can't escalate-to-human like Claude Code, so a risky verdict
+// is held (deny + login hint) rather than prompted — safe tools still run, which is
+// enough for the user to recover the key.
+function applyNoKeyDecision(toolName, toolInput) {
+  if (MODE === 'observe' || FAIL_OPEN) return // codex: no output = allow
+  const verdict = classify({ tool: toolName, input: toolInput })
+  if (verdict.verdictHint === VERDICT.ALLOW) return // allow
+  const floor = verdict.verdictHint === VERDICT.DENY
+  const reason = floor
+    ? `VAIBot floor — ${toolName} blocked (${verdict.reasons?.[0] ?? 'catastrophic action'}), enforced even without an API key.`
+    : `VAIBot held ${toolName} (${verdict.risk} risk) — no API key, so it can't be sent for approval. Run \`vaibot login\` to restore governance + approvals. Safe tools still run.`
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason },
+  }))
+  process.stderr.write(`VAIBot: ${reason}\n`)
+}
+
 // ── Fingerprint ────────────────────────────────────────────────────────────
 // Forensic correlation signal — NOT machine attestation.
 // Used for bootstrap idempotency and abuse pattern detection.
@@ -523,22 +543,24 @@ async function main() {
     process.exit(0)
   }
 
-  // No API key — try auto-bootstrap
+  // No API key — try auto-bootstrap. If it can't yield a key (account already exists
+  // and the local key was lost, or the endpoint is unreachable), do NOT fail-closed
+  // and brick — govern LOCALLY via the classifier so safe work + `vaibot login`
+  // recovery proceed while the catastrophic floor still holds.
   if (!API_KEY) {
     try {
       const bootstrapKey = await bootstrap()
       if (bootstrapKey) {
         API_KEY = bootstrapKey
       } else {
-        // Fail-closed: no usable API key → can't govern → deny in enforce.
-        if (FAIL_OPEN || MODE === 'observe') process.exit(0)
-        process.stderr.write('VAIBot: no API key (run `vaibot login`) — denying (fail-closed)\n')
-        process.exit(2)
+        process.stderr.write('VAIBot: no API key — governing locally (safe tools run, risky held, floor enforced). Run `vaibot login` to restore server-backed governance + approvals.\n')
+        applyNoKeyDecision(toolName, toolInput)
+        process.exit(0)
       }
     } catch (err) {
-      process.stderr.write(`VAIBot [bootstrap]: ${err.message}\n`)
-      if (FAIL_OPEN || MODE === 'observe') process.exit(0)
-      process.exit(2) // fail-closed on bootstrap failure
+      process.stderr.write(`VAIBot [bootstrap]: ${err.message} — governing locally until a key is available.\n`)
+      applyNoKeyDecision(toolName, toolInput)
+      process.exit(0)
     }
   }
 
