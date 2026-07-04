@@ -82,7 +82,11 @@ const DASHBOARD_URL = (process.env.VAIBOT_DASHBOARD_URL ?? 'https://www.vaibot.i
 const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
 const AGENT_ID = 'codex'
 const FAIL_OPEN = process.env.VAIBOT_FAIL_OPEN === 'true'
-const MODE = process.env.VAIBOT_MODE ?? 'observe'
+// Default posture is ENFORCE. When the guard is reachable it publishes the
+// account's effective_mode (which wins); this default only governs the guard-DOWN
+// fallback, where enforce degrades *conditionally* (see applyGuardDownDecision)
+// instead of blanket-denying a fresh install.
+const MODE = process.env.VAIBOT_MODE ?? 'enforce'
 
 // ── Circuit breaker ────────────────────────────────────────────────────────
 // Local fallback. Sliding-window failure counter: N transient API errors
@@ -183,6 +187,102 @@ function emitBreakerDeny(reason) {
       permissionDecision: 'deny',
       permissionDecisionReason: reason,
     },
+  }))
+  process.stderr.write(`VAIBot: ${reason}\n`)
+}
+
+// Cold start = a machine where the guard has never written a rendezvous lock.
+// Conditions the guard-unreachable degrade: a fresh install (no lock) may still be
+// bringing the daemon up, so it degrades to the local floor instead of bricking;
+// an established install whose lock is present but now unreachable is treated as
+// possible tampering and stays fail-closed. Same-user best-effort — a deleted lock
+// can spoof cold-start, which is why guard-down still audits + alerts either way.
+function isColdStart() {
+  try {
+    return !existsSync(join(homedir(), '.vaibot', 'guard', 'guard.json'))
+  } catch {
+    return false // unreadable → do NOT assume fresh; fail toward fail-closed
+  }
+}
+
+// The last account posture the guard published into the rendezvous (guard.json). When the
+// guard is down we can't fetch the LIVE account mode, but this tells us what it WAS — so we
+// stay transparent (per the Compromised-Agent Defense Model §9 "make trust posture visible
+// to the operator") when we fail closed over an account deliberately set to observe.
+function lastKnownAccountMode() {
+  try {
+    const m = JSON.parse(readFileSync(join(homedir(), '.vaibot', 'guard', 'guard.json'), 'utf-8'))?.effective_mode
+    return m === 'observe' || m === 'enforce' ? m : null
+  } catch {
+    return null
+  }
+}
+
+// Guard unreachable under enforce → conditioned degrade (NOT a blanket allow):
+//  * the catastrophic floor is enforced LOCALLY in every case (classifier
+//    DANGEROUS → deny), so rm -rf /, guard self-protection, fork bombs, etc. are
+//    blocked even with no daemon running;
+//  * cold start (fresh install, no rendezvous lock) → allow-with-audit so the box
+//    can bootstrap the daemon;
+//  * established install (lock present) but daemon gone and un-relaunchable →
+//    possible tampering → stay fail-closed (deny) + alert.
+function applyGuardDownDecision(toolName, toolInput) {
+  const verdict = classify({ tool: toolName, input: toolInput })
+  const dangerous = verdict.verdictHint === VERDICT.DENY
+  // Cold start (fresh install, no rendezvous lock) + non-catastrophic → degrade to
+  // allow-with-audit so the box can bring the daemon up. Dangerous still denies.
+  if (isColdStart() && !dangerous) {
+    process.stderr.write(
+      `VAIBot [degraded]: guard not up yet (fresh install) — ${toolName} allowed with audit; ` +
+      `catastrophic floor still enforced. If the guard never comes up, see ~/.vaibot/guard/launch.log.\n`,
+    )
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
+    }))
+    process.exit(0)
+  }
+  // Established install (rendezvous lock present) but the guard is gone: possibly
+  // tampering, so ALERT — but do NOT brick the agent. A normal reboot/crash lands here
+  // too (guard.json survives, a self-spawned daemon does not), and the recovery path
+  // (`vaibot login`) MUST stay reachable in-agent. Govern LOCALLY via the classifier —
+  // classifier-safe passes (recovery + normal work continue), risky held, the
+  // catastrophic floor still hard-denies — the same posture as the keyless path. The
+  // cold-start+dangerous case (guard never came up, catastrophic tool) also lands here
+  // and is floor-denied by applyNoKeyDecision.
+  if (!isColdStart()) {
+    // §9 transparency: if the account was deliberately on observe, make the fail-closed
+    // override LOUD so an operator isn't silently surprised when it starts governing.
+    const observeOverride = lastKnownAccountMode() === 'observe' && MODE !== 'observe'
+    process.stderr.write(
+      `VAIBot [degraded]: guard ran here but is now unreachable — governing locally ` +
+      `(possible tampering; audited).` +
+      (observeOverride
+        ? ` NOTE: this account's posture was 'observe', but the guard is down — VAIBot is ` +
+          `FAILING CLOSED to enforce locally until it recovers (deliberate policy).`
+        : '') +
+      ` See ~/.vaibot/guard/launch.log.\n`,
+    )
+  }
+  applyNoKeyDecision(toolName, toolInput)
+  process.exit(0)
+}
+
+// No usable API key (bootstrap can't provision one — the account already exists but the
+// local key was lost, or the endpoint is unreachable) → do NOT brick. Govern LOCALLY via
+// the classifier so safe work + `vaibot login` recovery proceed while the catastrophic
+// floor still holds. Codex can't escalate-to-human like Claude Code, so a risky verdict
+// is held (deny + login hint) rather than prompted — safe tools still run, which is
+// enough for the user to recover the key.
+function applyNoKeyDecision(toolName, toolInput) {
+  if (MODE === 'observe' || FAIL_OPEN) return // codex: no output = allow
+  const verdict = classify({ tool: toolName, input: toolInput })
+  if (verdict.verdictHint === VERDICT.ALLOW) return // allow
+  const floor = verdict.verdictHint === VERDICT.DENY
+  const reason = floor
+    ? `VAIBot floor — ${toolName} blocked (${verdict.reasons?.[0] ?? 'catastrophic action'}), enforced even without an API key.`
+    : `VAIBot held ${toolName} (${verdict.risk} risk) — no API key, so it can't be sent for approval. Run \`vaibot login\` to restore governance + approvals. Safe tools still run.`
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason },
   }))
   process.stderr.write(`VAIBot: ${reason}\n`)
 }
@@ -472,22 +572,24 @@ async function main() {
     process.exit(0)
   }
 
-  // No API key — try auto-bootstrap
+  // No API key — try auto-bootstrap. If it can't yield a key (account already exists
+  // and the local key was lost, or the endpoint is unreachable), do NOT fail-closed
+  // and brick — govern LOCALLY via the classifier so safe work + `vaibot login`
+  // recovery proceed while the catastrophic floor still holds.
   if (!API_KEY) {
     try {
       const bootstrapKey = await bootstrap()
       if (bootstrapKey) {
         API_KEY = bootstrapKey
       } else {
-        // Fail-closed: no usable API key → can't govern → deny in enforce.
-        if (FAIL_OPEN || MODE === 'observe') process.exit(0)
-        process.stderr.write('VAIBot: no API key (run `vaibot login`) — denying (fail-closed)\n')
-        process.exit(2)
+        process.stderr.write('VAIBot: no API key — governing locally (safe tools run, risky held, floor enforced). Run `vaibot login` to restore server-backed governance + approvals.\n')
+        applyNoKeyDecision(toolName, toolInput)
+        process.exit(0)
       }
     } catch (err) {
-      process.stderr.write(`VAIBot [bootstrap]: ${err.message}\n`)
-      if (FAIL_OPEN || MODE === 'observe') process.exit(0)
-      process.exit(2) // fail-closed on bootstrap failure
+      process.stderr.write(`VAIBot [bootstrap]: ${err.message} — governing locally until a key is available.\n`)
+      applyNoKeyDecision(toolName, toolInput)
+      process.exit(0)
     }
   }
 
@@ -533,8 +635,8 @@ async function main() {
       saveBreakerSnapshot(breaker.snapshot())
       if (breaker.isTripped()) { applyBreakerTrippedDecision(breaker, toolName, toolInput); process.exit(0) }
       if (FAIL_OPEN || MODE === 'observe') process.exit(0)
-      process.stderr.write(`VAIBot: local guard unavailable and FAIL_OPEN=false — denying ${toolName}\n`)
-      process.exit(2)
+      applyGuardDownDecision(toolName, toolInput)
+      process.exit(0)
     }
 
     const result = await decideViaGuard(
