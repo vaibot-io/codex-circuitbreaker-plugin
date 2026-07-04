@@ -20,7 +20,15 @@ The MCP server gives the agent a way to query and interact with VAIBot. This plu
 
 ## Quick start
 
-Install in two steps from inside the Codex CLI:
+**Recommended — install the whole stack in one command.** The `vaibot` CLI is the entry point: it installs the guard, detects and wires your agents (including Codex), and sets a policy floor. macOS + Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vaibot-io/command-cli/main/install.sh | sh
+```
+
+### Just the plugin
+
+Or install only the plugin from inside the Codex CLI:
 
 ```bash
 # 1. Register the marketplace (clones the repo into Codex's marketplace cache)
