@@ -1,5 +1,7 @@
 # VAIBot Governance Plugin for Codex CLI
 
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/mc2HuR2kgG)
+
 A Codex CLI plugin that intercepts every tool call, evaluates it against your governance policy, and enforces the decision before execution proceeds — with cryptographically signed, on-chain-anchored audit receipts of every decision.
 
 VAIBot ships parallel plugins for Claude Code, OpenClaw, and now Codex CLI. One VAIBot account works across all three.
@@ -233,7 +235,7 @@ State written outside `~/.codex/`:
 
 ## Community & support
 
-**[Join the VAIBot Discord](https://discord.gg/mSHYtP5nV)** — get help, share feedback, and connect with other users.
+**[Join the VAIBot Discord](https://discord.gg/mc2HuR2kgG)** — get help, share feedback, and connect with other users.
 
 VAIBot is in early access. If you're installing this plugin now, you're among the first developers putting verifiable AI governance into Codex production. Founding members get direct access to the VAIBot team, early previews, and recognition in the project.
 
