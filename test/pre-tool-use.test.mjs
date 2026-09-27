@@ -517,3 +517,113 @@ test('STATE_DIR perms are tightened on the fly when a legacy 0o755 dir already e
     try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
   }
 })
+
+// ── Containment ───────────────────────────────────────────────────────────────
+// Containment is the account-wide stop. The guard enforces it for any call that
+// reaches the daemon; these tests pin the half the breaker owns — the paths where
+// the daemon is never consulted, which are exactly the paths a stop has to
+// survive. The record needs no daemon, no network and no credentials, so each
+// case also asserts the mock server was never called.
+
+// Seed the machine-wide record into a home the hook will read, the way the guard
+// writes it. A string is written verbatim so a corrupt record can be seeded.
+function homeWithContainment(record) {
+  const home = mkdtempSync(join(tmpdir(), 'vaibot-codex-contain-home-'))
+  const guardDir = join(home, '.vaibot', 'guard')
+  mkdirSync(guardDir, { recursive: true })
+  writeFileSync(join(guardDir, 'containment.json'), typeof record === 'string' ? record : JSON.stringify(record))
+  return home
+}
+
+const CONTAINED = { contained: true, reason: 'laptop looks compromised', at: new Date().toISOString() }
+
+test('contained: a benign tool call is denied, and the guard is never consulted', async () => {
+  const sharedHome = homeWithContainment(CONTAINED)
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      sharedHome,
+      input: { tool_name: 'Read', tool_input: { file_path: '/tmp/notes.txt' }, session_id: 'sess_c1', tool_use_id: 'tu_c1' },
+    })
+    const out = JSON.parse(r.stdout).hookSpecificOutput
+    assert.equal(out.permissionDecision, 'deny')
+    assert.match(out.permissionDecisionReason, /containment engaged/i)
+    assert.match(out.permissionDecisionReason, /laptop looks compromised/, 'the engage reason should reach the agent')
+    assert.equal(server.requests.length, 0, 'containment must not need the daemon or the control plane')
+  } finally {
+    await server.close()
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('contained: observe mode does NOT lift it — nothing else survives observe', async () => {
+  const sharedHome = homeWithContainment(CONTAINED)
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      mode: 'observe',
+      sharedHome,
+      input: { tool_name: 'Read', tool_input: { file_path: '/tmp/notes.txt' }, session_id: 'sess_c2', tool_use_id: 'tu_c2' },
+    })
+    assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny')
+    assert.equal(server.requests.length, 0)
+  } finally {
+    await server.close()
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('contained: VAIBOT_FAIL_OPEN does NOT lift it — the fail-open path is the point', async () => {
+  const sharedHome = homeWithContainment(CONTAINED)
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      sharedHome,
+      env: { VAIBOT_FAIL_OPEN: 'true' },
+      input: { tool_name: 'Bash', tool_input: { command: 'echo hi' }, session_id: 'sess_c3', tool_use_id: 'tu_c3' },
+    })
+    assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny')
+    assert.equal(server.requests.length, 0)
+  } finally {
+    await server.close()
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('contained: the governance tools stay usable, so an operator can lift it', async () => {
+  const sharedHome = homeWithContainment(CONTAINED)
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      sharedHome,
+      input: { tool_name: 'mcp__vaibot__vaibot_status', tool_input: {}, session_id: 'sess_c4', tool_use_id: 'tu_c4' },
+    })
+    assert.equal(r.code, 0)
+    assert.equal(r.stdout.trim(), '', 'a governance self-call is not gated, contained or not')
+  } finally {
+    await server.close()
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('a corrupt containment record does not claim containment', async () => {
+  // The breaker reads this on every tool call; it must never take the hook down,
+  // and must never fail INTO a stop.
+  const sharedHome = homeWithContainment('{ not json')
+  const server = await startMockServer(() => ({ status: 200, body: { ok: true } }))
+  try {
+    const r = await runHook({
+      apiUrl: server.url,
+      sharedHome,
+      input: { tool_name: 'Read', tool_input: { file_path: '/tmp/notes.txt' }, session_id: 'sess_c5', tool_use_id: 'tu_c5' },
+    })
+    assert.ok(!/containment engaged/i.test(r.stdout), 'an unreadable record must not read as contained')
+  } finally {
+    await server.close()
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
+})
