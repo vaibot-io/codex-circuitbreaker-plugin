@@ -571,7 +571,16 @@ async function main() {
   // Skip governance for the governance tools themselves (avoid recursion).
   // Codex MCP naming: mcp__<server>__<tool>. The hooks.json matcher *should*
   // already filter these via negative-lookahead, but defence-in-depth here.
-  if (toolName.startsWith('mcp__vaibot__') || toolName.startsWith('mcp__vaibot')) {
+  // Governance tools are exempt so a governance call cannot recurse into governing
+  // itself, and so an operator can still lift containment from inside the agent.
+  //
+  // Matched at the namespace boundary, NOT as a bare prefix. Codex names MCP
+  // tools `mcp__<server>__<tool>`, so an exemption that any name merely BEGINNING
+  // with `mcp__vaibot` satisfied would hand a server called `vaibotage` a whole
+  // tool namespace that is never governed at all -- no containment, no floor,
+  // nothing. This check runs before the containment check below, so that gap was a
+  // way around the account-wide stop.
+  if (toolName === 'mcp__vaibot' || toolName.startsWith('mcp__vaibot__')) {
     process.exit(0)
   }
 
