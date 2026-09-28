@@ -102,7 +102,16 @@ async function main() {
   const cwd = hookInput.cwd ?? process.cwd()
 
   // vaibot's own governance tools are never gated (mirrors the PreToolUse skip).
-  if (toolName.startsWith('mcp__vaibot')) process.exit(0)
+  // Governance tools are exempt so a governance call cannot recurse into governing
+  // itself, and so an operator can still lift containment from inside the agent.
+  //
+  // Matched at the namespace boundary, NOT as a bare prefix. Codex names MCP
+  // tools `mcp__<server>__<tool>`, so an exemption that any name merely BEGINNING
+  // with `mcp__vaibot` satisfied would hand a server called `vaibotage` a whole
+  // tool namespace that is never governed at all -- no containment, no floor,
+  // nothing. This check runs before the containment check below, so that gap was a
+  // way around the account-wide stop.
+  if (toolName === 'mcp__vaibot' || toolName.startsWith('mcp__vaibot__')) process.exit(0)
 
   // Observe mode never auto-decides — log-only; let the native flow proceed.
   if (MODE === 'observe') {
