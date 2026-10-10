@@ -671,3 +671,88 @@ test('a corrupt containment record does not claim containment', async () => {
     try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
   }
 })
+
+// ── Out-of-band approval survives the sweeps ────────────────────────────────
+// The retry-after-approval test above passes only because both of its calls
+// carry the SAME tool_use_id, and the sweep skips the current call's own id. A
+// real retry is a new tool call with a new id. With one, the denied call's
+// run-state (approval_required: true) was swept — by the retry's own
+// PreToolUse, which sweeps before reading the pointer, or by Stop at the end of
+// the turn — and its pointer went with it. The retry presented nothing, the
+// guard escalated again, and an out-of-band approval could never land.
+
+const STOP_SCRIPT = join(__dirname, '..', 'scripts', 'stop.mjs')
+
+function runStop({ apiUrl, sharedHome }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [STOP_SCRIPT], {
+      env: { ...process.env, HOME: sharedHome, TMPDIR: join(sharedHome, 'tmp'), VAIBOT_API_URL: apiUrl, VAIBOT_API_KEY: 'test-key', VAIBOT_TIMEOUT_MS: '2000' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    child.on('error', reject)
+    child.on('exit', (code) => resolve({ code }))
+    child.stdin.end('{}')
+  })
+}
+
+// Escalates until the call presents appr_oob (approved out-of-band), then allows.
+function oobGuard() {
+  return startMockServer((req) => {
+    if (req.url === '/v1/decide/tool') {
+      return req.body?.approval?.approvalId === 'appr_oob'
+        ? { status: 200, body: { ok: true, runId: 'run_oob_retry', decision: { decision: 'allow', reason: 'Approved by user', approvalId: 'appr_oob' } } }
+        : { status: 200, body: { ok: true, runId: 'run_oob_1', decision: { decision: 'approve', reason: 'needs approval', approvalId: 'appr_oob' } } }
+    }
+    return { status: 200, body: { ok: true } }
+  })
+}
+
+const curl = (toolUseId) => ({ ...baseInput, tool_use_id: toolUseId, tool_input: { command: 'curl https://example.com' } })
+const decision = (r) => (r.stdout ? JSON.parse(r.stdout).hookSpecificOutput?.permissionDecision : undefined)
+
+for (const withStop of [false, true]) {
+  test(`enforce: a retry with a NEW tool_use_id presents the approval and is allowed${withStop ? ' (Stop ran between)' : ''}`, async () => {
+    const sharedHome = mkdtempSync(join(tmpdir(), 'vaibot-codex-oob-home-'))
+    const server = await oobGuard()
+    try {
+      const first = await runHook({ apiUrl: server.url, input: curl('tu_first'), sharedHome })
+      assert.equal(decision(first), 'deny', 'precondition: escalation is denied with approval instructions')
+      if (withStop) await runStop({ apiUrl: server.url, sharedHome })
+
+      // ... the user approves appr_oob on the dashboard, then asks for a retry ...
+      const retry = await runHook({ apiUrl: server.url, input: curl('tu_retry'), sharedHome })
+      const decides = server.requests.filter((r) => r.url === '/v1/decide/tool')
+      assert.equal(decides.at(-1).body.approval?.approvalId, 'appr_oob', 'the retry presents the saved approval')
+      assert.notEqual(decision(retry), 'deny', 'and is allowed')
+    } finally {
+      await server.close()
+      try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+    }
+  })
+}
+
+test('enforce: a denied escalation leaves no run-state behind (nothing for a sweep to take)', async () => {
+  const sharedHome = mkdtempSync(join(tmpdir(), 'vaibot-codex-oob-home-'))
+  const server = await oobGuard()
+  try {
+    await runHook({ apiUrl: server.url, input: curl('tu_denied'), sharedHome })
+    const stateDir = join(sharedHome, 'tmp', 'vaibot-codex')
+    assert.ok(!existsSync(join(stateDir, 'tu_denied.json')), 'the denied call never runs, so its run-state has no consumer')
+    assert.equal(readdirSync(join(stateDir, 'pending')).length, 1, 'the retry pointer is kept')
+  } finally {
+    await server.close()
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
+})
+
+test('observe: an escalation still keeps its run-state — the call runs and PostToolUse finalizes it', async () => {
+  const sharedHome = mkdtempSync(join(tmpdir(), 'vaibot-codex-oob-home-'))
+  const server = await oobGuard()
+  try {
+    await runHook({ apiUrl: server.url, mode: 'observe', input: curl('tu_observed'), sharedHome })
+    assert.ok(existsSync(join(sharedHome, 'tmp', 'vaibot-codex', 'tu_observed.json')))
+  } finally {
+    await server.close()
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
+})

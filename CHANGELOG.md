@@ -2,6 +2,29 @@
 
 All notable changes to `@vaibot/codex-circuitbreaker-plugin`.
 
+## [Unreleased]
+
+### Fixed
+- **Approving out-of-band and retrying now lets the call through.** In enforce mode, a
+  call that needs approval is denied with instructions to approve on the dashboard or
+  with `vaibot approve`, then retry. The plugin saves a retry pointer so the retry
+  presents that approval. But the denied call also left its run-state behind
+  (`approval_required: true`), and the next hook's sweep took it and **deleted the
+  pointer with it**. That was either the retry's own PreToolUse, which sweeps before
+  reading the pointer, or Stop at the end of the turn. The retry then presented
+  nothing, the guard escalated again, and the call was denied again, every time.
+
+  A denied call never runs, so no PostToolUse would ever consume its run-state. The
+  deny branch now drops that entry and keeps the pointer. Observe mode, where the call
+  does run and PostToolUse finalizes it, is unchanged. The existing retry test passed
+  only because both of its calls had the same `tool_use_id`, which the sweep skips. The
+  new tests use a new id for the retry, as a real retry has, with and without Stop in
+  between.
+
+  Full effect needs guard **2.3.1**. Until it's vendored, a retry made *before* the
+  approval is granted gets a hard `Approval not approved (status=pending)` deny, and
+  that deny clears the pointer. 2.3.1 asks again under the same approval instead.
+
 ## [1.3.2] — 2026-09-28 — the governance exemption, and guard 2.3.0
 
 ### Changed

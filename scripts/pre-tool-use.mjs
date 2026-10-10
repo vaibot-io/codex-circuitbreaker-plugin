@@ -371,6 +371,10 @@ function saveRunState(toolCallId, state) {
   } catch { /* best-effort */ }
 }
 
+function dropRunState(toolCallId) {
+  try { unlinkSync(join(STATE_DIR, `${toolCallId}.json`)) } catch { /* may not exist */ }
+}
+
 // ── Ask-in-flight sweep ────────────────────────────────────────────────────
 // When PreToolUse silently allowed an approval_required intent, the runState
 // carries `approval_required: true`. If the user picks Yes in Codex's native
@@ -790,6 +794,17 @@ async function main() {
       // reads this pointer, sends approved_content_hash, and the server
       // returns previously_approved=true → decision coerced to allow.
       if (contentHash) writePendingApproval(toolName, command, cwd, contentHash)
+
+      // This call is DENIED, so it never runs and no PostToolUse will ever
+      // consume its run-state. Left behind, the entry (approval_required: true)
+      // was taken by the next hook's sweep — the retry's own PreToolUse, which
+      // sweeps BEFORE reading the pointer, or Stop at the end of this turn — and
+      // the sweep deleted this call's pointer with it. The retry then presented
+      // no approval, the guard escalated again, and approving out-of-band could
+      // never let the call through. Drop the entry; keep the pointer for the
+      // retry. (The sweep exists for Claude Code's ask-in-flight, which Codex's
+      // PreToolUse does not have: an approval here is answered out-of-band.)
+      dropRunState(toolCallId)
 
       // Enforce mode: actually block. Codex's PreToolUse can't escalate-to-
       // human like Claude Code's 'ask', so the plugin issues a deny with
