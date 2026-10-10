@@ -2,70 +2,34 @@
 /**
  * VAIBot Codex CLI Stop hook.
  *
- * Fallback sweep for approval-required receipts that never got resolved by a
- * following PostToolUse or PreToolUse. If the assistant's turn ends with the
- * user having denied an approval_required prompt (and Codex didn't attempt
- * another tool), this hook is the final chance to record that denial on the
- * receipt chain.
+ * At the end of a turn, clears this session's approval_required run-state that
+ * its PostToolUse never consumed (plus abandoned entries from any session) —
+ * see lib/sweep.mjs.
+ *
+ * It records nothing. It used to PATCH the cloud `/v2/receipts/:hash/deny` for
+ * every such entry, which was wrong twice over: the only id a hook holds is the
+ * guard's LOCAL approval id, which the API does not key receipts by (so the call
+ * could only 404), and a codex escalation is never a human "No" — in enforce it
+ * is denied by the plugin and answered out-of-band, and Codex reports no answer
+ * to its own approval prompt.
  *
  * Per Codex hooks docs: Stop expects JSON only (plain text invalid). We don't
- * intervene in the stop flow; we just sweep + exit.
- *
- * Environment variables:
- *   VAIBOT_API_URL    — base URL of the VAIBot v2 API (default: https://api.vaibot.io)
- *   VAIBOT_API_KEY    — Bearer token (auto-loaded from ~/.vaibot/credentials.json)
- *   VAIBOT_TIMEOUT_MS — request timeout in ms (default: 10000)
+ * intervene in the stop flow; we just clear and exit with nothing on stdout.
  */
 
-import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { resolveCredentials } from '../vendor/vaibot-guard/scripts/lib/creds.mjs'
-
-const resolved = resolveCredentials()
-const API_URL = resolved.apiBaseUrl
-const API_KEY = resolved.apiKey ?? ''
-const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
+import { clearFinishedAsks } from './lib/sweep.mjs'
 
 const STATE_DIR = join(tmpdir(), 'vaibot-codex')
-const PENDING_DIR = join(STATE_DIR, 'pending')
 
 async function main() {
-  // Drain stdin even if we ignore the payload — Codex buffers it.
-  for await (const _chunk of process.stdin) { /* ignore */ }
+  let raw = ''
+  for await (const chunk of process.stdin) raw += chunk
+  let input = {}
+  try { input = JSON.parse(raw || '{}') } catch { /* sweep abandoned entries only */ }
 
-  if (!API_KEY) process.exit(0)
-
-  let files
-  try {
-    files = readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))
-  } catch { process.exit(0) }
-
-  for (const file of files) {
-    const path = join(STATE_DIR, file)
-    let entry
-    try { entry = JSON.parse(readFileSync(path, 'utf-8')) } catch { continue }
-
-    if (!entry?.approval_required || !entry.content_hash) continue
-
-    try { unlinkSync(path) } catch { continue }  // lost race to another hook
-
-    try {
-      await fetch(`${API_URL}/v2/receipts/${encodeURIComponent(entry.content_hash)}/deny`, {
-        method: 'PATCH',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      })
-    } catch { /* best-effort */ }
-
-    if (entry.intent_key) {
-      try { unlinkSync(join(PENDING_DIR, `${entry.intent_key}.json`)) } catch {}
-    }
-  }
-
-  // Stop hook output: stay neutral. Don't return decision/block — let the
-  // turn end naturally. Plain text is invalid for Stop per Codex docs, so
-  // emit nothing on stdout.
+  clearFinishedAsks(STATE_DIR, { sessionId: input.session_id ?? null, turnEnded: true })
   process.exit(0)
 }
 

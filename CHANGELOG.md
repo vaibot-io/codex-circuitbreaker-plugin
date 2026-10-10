@@ -5,6 +5,18 @@ All notable changes to `@vaibot/codex-circuitbreaker-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **Stop no longer records a denial nobody gave, and neither sweep touches another
+  session's calls.** Stop PATCHed the cloud `/v2/receipts/:hash/deny` for every
+  leftover `approval_required` entry. That was wrong twice over: the only id a hook holds
+  is the guard's local approval id, so the call could only 404, and a codex escalation
+  is never a human "No" (enforce answers it out-of-band; Codex reports no answer to its
+  own prompt). Stop now records nothing and needs no API key. Both sweeps, PreToolUse
+  and Stop, also cleared such entries for **every** Codex session on the machine, which
+  included another session's observe-mode call that was still running, whose PostToolUse
+  then had nothing to finalize. An entry is now cleared only when it is this session's
+  and from an earlier turn (or the turn has ended, for Stop), or when it has been
+  abandoned for over a day. Run-state records `session_id` and `turn_id`, and the rule
+  lives in one shared `scripts/lib/sweep.mjs`.
 - **Approving out-of-band and retrying now lets the call through.** In enforce mode, a
   call that needs approval is denied with instructions to approve on the dashboard or
   with `vaibot approve`, then retry. The plugin saves a retry pointer so the retry
