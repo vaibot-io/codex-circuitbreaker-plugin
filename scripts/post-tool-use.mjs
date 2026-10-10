@@ -60,7 +60,11 @@ function findRunState(toolName, toolUseId) {
           bestMatch = { ...data, file }
           break
         }
-        if (data.tool_name === toolName && data.ts > bestTs) {
+        // Same-tool fallback only for input with NO tool_use_id (Codex sends one
+        // on every PostToolUse). When this call HAS an id and its entry is gone,
+        // the newest same-tool entry is a DIFFERENT call — finalizing it would
+        // record this call's result against someone else's run.
+        if (!toolUseId && data.tool_name === toolName && data.ts > bestTs) {
           bestMatch = { ...data, file }
           bestTs = data.ts
         }
@@ -129,6 +133,10 @@ async function main() {
 
   const outcome = error ? 'blocked' : 'allowed'
   const result = { outcome }
+  // `ok: false` is what the guard reads as "the action failed"; outcome alone
+  // left failures on the receipt as allowed. (Codex's schema types
+  // tool_response as any JSON value, so `error` is only what it happens to carry.)
+  if (error) result.ok = false
   if (typeof durationMs === 'number') result.duration_ms = durationMs
   if (error) result.error = String(error).slice(0, 2000)
 

@@ -756,3 +756,28 @@ test('observe: an escalation still keeps its run-state — the call runs and Pos
     try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
   }
 })
+
+// ── The retry pointer is keyed on the exact call ────────────────────────────
+// extractCommand summarises apply_patch as "apply_patch <path>", so two
+// different patches to one file shared a pointer and the second presented the
+// first's approval id. The pointer is now keyed on tool + full input + cwd.
+test('enforce: a different patch to the same file does not present the first patch\'s approval', async () => {
+  const sharedHome = mkdtempSync(join(tmpdir(), 'vaibot-codex-key-home-'))
+  let n = 0
+  const server = await startMockServer((req) => req.url === '/v1/decide/tool'
+    ? { status: 200, body: { ok: true, runId: `run_k${++n}`, decision: { decision: 'approve', reason: 'needs approval', approvalId: `appr_k${n}` } } }
+    : { status: 200, body: { ok: true } })
+  const patch = (body, id) => ({ ...baseInput, tool_name: 'apply_patch', tool_use_id: id, tool_input: { path: 'src/app.js', patch: body } })
+  try {
+    await runHook({ apiUrl: server.url, input: patch('*** A', 'tu_pa'), sharedHome })
+    await runHook({ apiUrl: server.url, input: patch('*** B', 'tu_pb'), sharedHome })
+    const decides = server.requests.filter((r) => r.url === '/v1/decide/tool')
+    assert.equal(decides[1].body.approval?.approvalId, undefined, 'patch B carries no approval of patch A')
+    // ... and the identical call still finds its own pointer on retry.
+    await runHook({ apiUrl: server.url, input: patch('*** A', 'tu_pa2'), sharedHome })
+    assert.equal(server.requests.filter((r) => r.url === '/v1/decide/tool').at(-1).body.approval?.approvalId, 'appr_k1')
+  } finally {
+    await server.close()
+    try { rmSync(sharedHome, { recursive: true, force: true }) } catch {}
+  }
+})
