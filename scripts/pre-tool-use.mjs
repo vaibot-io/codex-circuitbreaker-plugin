@@ -55,6 +55,7 @@ import { classify, VERDICT } from '../vendor/vaibot-guard/scripts/classifier.mjs
 import { ensureGuardDefault } from '../vendor/vaibot-guard/scripts/lib/guard-launch.mjs'
 import { decideViaGuard } from '../vendor/vaibot-guard/scripts/lib/guard-client.mjs'
 import { readContainment } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
+import { clearFinishedAsks } from './lib/sweep.mjs'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -375,43 +376,6 @@ function dropRunState(toolCallId) {
   try { unlinkSync(join(STATE_DIR, `${toolCallId}.json`)) } catch { /* may not exist */ }
 }
 
-// ── Ask-in-flight sweep ────────────────────────────────────────────────────
-// When PreToolUse silently allowed an approval_required intent, the runState
-// carries `approval_required: true`. If the user picks Yes in Codex's native
-// approval flow, PostToolUse fires and PATCHes /approve. If the user picks
-// No, PostToolUse never fires — the entry remains until the next hook
-// (PreToolUse of a later call, or Stop) sweeps it and PATCHes /deny.
-//
-// Race note: claim the entry by unlinking it BEFORE issuing the network call.
-// Whichever process wins the unlink owns the resolution; the loser sees
-// ENOENT and bails out. Keeps the receipt event chain coherent under
-// concurrent hooks.
-
-async function sweepPendingApprovals({ excludeToolUseId } = {}) {
-  let files
-  try {
-    files = readdirSync(STATE_DIR).filter((f) => f.endsWith('.json'))
-  } catch { return }
-
-  for (const file of files) {
-    const path = join(STATE_DIR, file)
-    let entry
-    try { entry = JSON.parse(readFileSync(path, 'utf-8')) } catch { continue }
-
-    if (!entry?.approval_required) continue
-    if (excludeToolUseId && entry.tool_use_id === excludeToolUseId) continue
-    if (!entry.content_hash) { try { unlinkSync(path) } catch {} ; continue }
-
-    try { unlinkSync(path) } catch { continue }  // lost the race
-
-    // Guard approvals self-expire server-side; the sweep only cleans stale
-    // local run-state (no network call).
-    if (entry.intent_key) {
-      try { unlinkSync(join(PENDING_DIR, `${entry.intent_key}.json`)) } catch {}
-    }
-  }
-}
-
 // ── Pending-approval state (retry awareness) ────────────────────────────────
 // Untrusted hint only. Server re-verifies intent (tool + command + cwd)
 // against the referenced approved receipt before honoring a short-circuit.
@@ -571,6 +535,7 @@ async function main() {
   const toolInput = hookInput.tool_input ?? {}
   const sessionId = hookInput.session_id ?? `cdx-${Date.now()}`
   const toolUseId = hookInput.tool_use_id ?? null
+  const turnId = hookInput.turn_id ?? null
 
   // Skip governance for the governance tools themselves (avoid recursion).
   // Codex MCP naming: mcp__<server>__<tool>. The hooks.json matcher *should*
@@ -631,7 +596,9 @@ async function main() {
   }
 
   // Resolve still-pending ask-in-flight from a prior tool call.
-  await sweepPendingApprovals({ excludeToolUseId: toolUseId })
+  // Clear this session's observe-mode escalations from earlier turns (their
+  // PostToolUse has had its chance) and abandoned ones — see lib/sweep.mjs.
+  clearFinishedAsks(STATE_DIR, { sessionId, turnId })
 
   // ── Breaker check (before any API call) ──
   // Load persisted state from disk and check trip. Tripped → decide locally and
@@ -747,6 +714,9 @@ async function main() {
       tool_name: toolName,
       tool_call_id: toolCallId,
       tool_use_id: toolUseId,
+      // Whose call this is: the sweeps only ever clear their own session's.
+      session_id: sessionId,
+      turn_id: turnId,
       approval_required: rawDecision === 'approval_required' && !data.previously_approved,
       intent_key: intentHash(toolName, command, cwd),
       ts: Date.now(),
