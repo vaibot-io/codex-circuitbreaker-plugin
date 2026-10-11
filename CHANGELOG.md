@@ -5,6 +5,19 @@ All notable changes to `@vaibot/codex-circuitbreaker-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **Every call is finalized with the result it had.** Codex runs `PostToolUse` only
+  for a call it counts as succeeded, and has no failure hook. The plugin now closes
+  every run it opens exactly once:
+  - a shell command that exits non-zero is finalized `ok: false` with its exit code
+    (`exit code 2`), read from the session transcript Codex passes to the hook. When
+    the transcript has no record of the call, the result is recorded as before;
+  - at the end of a turn, `Stop` finalizes this session's runs that no `PostToolUse`
+    closed (a failed MCP call or `apply_patch`) as `ok: false`, with the failure the
+    transcript reports, or `tool call did not complete successfully`. Another
+    session's runs are left alone;
+  - a call the plugin denies is finalized `blocked` when it is denied, since it never runs;
+  - a call that runs for longer than five minutes is still finalized by its own
+    `PostToolUse`. Its run-state is now kept until the call finishes (or for a day).
 - **The retry pointer is keyed on the exact call.** It was keyed on a summary of the
   call (`"apply_patch <path>"` for patches and edits), so every change to one file shared
   one pointer, and a retry could present a *different* change's approval id. It's now
