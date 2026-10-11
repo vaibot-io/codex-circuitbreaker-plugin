@@ -5,6 +5,18 @@ All notable changes to `@vaibot/codex-circuitbreaker-plugin`.
 ## [Unreleased]
 
 ### Fixed
+- **The retry pointer is keyed on the exact call.** It was keyed on a summary of the
+  call (`"apply_patch <path>"` for patches and edits), so every change to one file shared
+  one pointer, and a retry could present a *different* change's approval id. It's now
+  tool + full input (stable key order) + cwd, as in the claudecode plugin.
+- **PostToolUse never finalizes a different call.** When this call's run-state was
+  gone, it fell back to "the newest entry for this tool", which belongs to another call.
+  Codex sends `tool_use_id` on every PostToolUse, so the fallback now applies only to
+  input without one.
+- **Detected failures are recorded as failed.** The finalize now carries `ok: false`,
+  which is what the guard reads. Before, a failure was recorded as allowed. Codex's
+  schema types `tool_response` as any JSON value, so detection still depends on an
+  `error` / `is_error` field being present.
 - **Stop no longer records a denial nobody gave, and neither sweep touches another
   session's calls.** Stop PATCHed the cloud `/v2/receipts/:hash/deny` for every
   leftover `approval_required` entry. That was wrong twice over: the only id a hook holds

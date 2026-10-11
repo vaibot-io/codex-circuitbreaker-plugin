@@ -380,32 +380,46 @@ function dropRunState(toolCallId) {
 // Untrusted hint only. Server re-verifies intent (tool + command + cwd)
 // against the referenced approved receipt before honoring a short-circuit.
 
-function intentHash(tool, command, cwd) {
-  return createHash('sha256').update(`${tool}|${command ?? ''}|${cwd ?? ''}`).digest('hex').slice(0, 32)
+// Keyed on the EXACT call — tool, full input (stable key order), cwd — not on a
+// summary of it. extractCommand summarises apply_patch/Edit/Write as
+// "<tool> <path>", so every change to one file shared a pointer: a retry could
+// present a DIFFERENT change's approval id (guard 2.3.0: a hard pending-deny or a
+// scope-mismatch deny). Two different calls never share a pointer now; a retry
+// of the identical call still finds its own.
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
 }
 
-function pendingPath(tool, command, cwd) {
-  return join(PENDING_DIR, `${intentHash(tool, command, cwd)}.json`)
+function callKey(tool, input, cwd) {
+  return createHash('sha256').update(`${tool}|${stableStringify(input ?? {})}|${cwd ?? ''}`).digest('hex').slice(0, 32)
 }
 
-function readPendingApproval(tool, command, cwd) {
+function pendingPath(tool, input, cwd) {
+  return join(PENDING_DIR, `${callKey(tool, input, cwd)}.json`)
+}
+
+function readPendingApproval(tool, input, cwd) {
   try {
-    const p = pendingPath(tool, command, cwd)
+    const p = pendingPath(tool, input, cwd)
     if (!existsSync(p)) return null
     return JSON.parse(readFileSync(p, 'utf-8'))
   } catch { return null }
 }
 
-function writePendingApproval(tool, command, cwd, contentHash) {
+function writePendingApproval(tool, input, cwd, contentHash) {
   try {
     ensureStateDir()
     mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
-    writeFileSync(pendingPath(tool, command, cwd), JSON.stringify({ content_hash: contentHash, ts: Date.now() }), { mode: 0o600 })
+    writeFileSync(pendingPath(tool, input, cwd), JSON.stringify({ content_hash: contentHash, ts: Date.now() }), { mode: 0o600 })
   } catch { /* best-effort */ }
 }
 
-function clearPendingApproval(tool, command, cwd) {
-  try { unlinkSync(pendingPath(tool, command, cwd)) } catch { /* may not exist */ }
+function clearPendingApproval(tool, input, cwd) {
+  try { unlinkSync(pendingPath(tool, input, cwd)) } catch { /* may not exist */ }
 }
 
 // ── Onboarding nudge (one-shot per session) ────────────────────────────────
@@ -618,14 +632,14 @@ async function main() {
 
   // Retry awareness: if we previously got approval_required for this exact
   // intent and saved a pointer, present it to the guard for redemption.
-  const pending = readPendingApproval(toolName, command, cwd)
+  const pending = readPendingApproval(toolName, toolInput, cwd)
 
   if (process.env.VAIBOT_DEBUG === '1') {
-    const ih = intentHash(toolName, command, cwd)
-    const pp = pendingPath(toolName, command, cwd)
+    const ck = callKey(toolName, toolInput, cwd)
+    const pp = pendingPath(toolName, toolInput, cwd)
     process.stderr.write(
       `VAIBot [debug] pre: tool=${toolName} cwd=${cwd} cmd=${(command ?? '').slice(0, 80)}\n` +
-      `VAIBot [debug] pre: intentHash=${ih} pendingFile=${pp} pendingExists=${existsSync(pp)} sentApproved=${pending?.content_hash ?? 'none'}\n`
+      `VAIBot [debug] pre: callKey=${ck} pendingFile=${pp} pendingExists=${existsSync(pp)} sentApproved=${pending?.content_hash ?? 'none'}\n`
     )
   }
 
@@ -718,7 +732,7 @@ async function main() {
       session_id: sessionId,
       turn_id: turnId,
       approval_required: rawDecision === 'approval_required' && !data.previously_approved,
-      intent_key: intentHash(toolName, command, cwd),
+      intent_key: callKey(toolName, toolInput, cwd),
       ts: Date.now(),
     })
 
@@ -749,7 +763,7 @@ async function main() {
     const decision = data.previously_approved ? 'allow' : rawDecision
 
     if (decision === 'allow') {
-      clearPendingApproval(toolName, command, cwd)
+      clearPendingApproval(toolName, toolInput, cwd)
       // Codex: omitting permissionDecision = allow. No output needed.
       process.exit(0)
     }
@@ -760,10 +774,10 @@ async function main() {
       const riskLabel = data.risk?.risk ?? 'elevated'
 
       // Save pointer so the retry of this exact intent can short-circuit. On
-      // the next PreToolUse for the same (tool, command, cwd), the plugin
+      // the next PreToolUse for the same exact call (tool, input, cwd), the plugin
       // reads this pointer, sends approved_content_hash, and the server
       // returns previously_approved=true → decision coerced to allow.
-      if (contentHash) writePendingApproval(toolName, command, cwd, contentHash)
+      if (contentHash) writePendingApproval(toolName, toolInput, cwd, contentHash)
 
       // This call is DENIED, so it never runs and no PostToolUse will ever
       // consume its run-state. Left behind, the entry (approval_required: true)
@@ -814,7 +828,7 @@ async function main() {
 
     if (decision === 'deny') {
       const reason = rawReason ?? `Denied by policy for ${toolName}`
-      clearPendingApproval(toolName, command, cwd)
+      clearPendingApproval(toolName, toolInput, cwd)
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
