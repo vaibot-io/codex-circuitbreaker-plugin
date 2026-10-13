@@ -18,6 +18,15 @@ All notable changes to `@vaibot/codex-circuitbreaker-plugin`.
   - a call the plugin denies is finalized `blocked` when it is denied, since it never runs;
   - a call that runs for longer than five minutes is still finalized by its own
     `PostToolUse`. Its run-state is now kept until the call finishes (or for a day).
+- **The plugin's hooks load in Codex.** Codex reads hook matchers with Rust's regex
+  engine and runs plugin hooks with `PLUGIN_ROOT` set. `hooks/hooks.json` now uses the
+  match-all matcher `"*"` for `PreToolUse`, `PermissionRequest` and `PostToolUse`, and
+  starts every hook script from `$PLUGIN_ROOT`. The hook scripts already skip VAIBot's
+  own `mcp__vaibot__*` tools, so the set of governed tools is unchanged. A new test
+  checks every matcher and command against Codex's rules.
+
+  Requires Codex CLI 0.131.0 or later. Codex runs plugin hooks only once they are
+  trusted, so open `/hooks` after updating and trust this plugin's hooks.
 - **The retry pointer is keyed on the exact call.** It was keyed on a summary of the
   call (`"apply_patch <path>"` for patches and edits), so every change to one file shared
   one pointer, and a retry could present a *different* change's approval id. It's now

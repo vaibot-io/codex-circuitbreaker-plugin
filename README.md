@@ -43,6 +43,10 @@ The plugin lands at `~/.codex/plugins/cache/vaibot-io/vaibot-codex-circuitbreake
 
 After install, restart your Codex session so it picks up the new hook config and MCP server registration.
 
+**Requires Codex CLI 0.131.0 or later**, the first release that runs hooks shipped inside a plugin. Check with `codex --version`.
+
+Codex runs a plugin's hooks only after you trust them. After installing, and again after each update, open `/hooks` in a Codex session and trust the `vaibot-codex-circuitbreaker` hooks. Until then they show as untrusted (or "Modified since last trusted") and do not run.
+
 ## What you see at runtime
 
 **Allowed tool** — passes through silently. A receipt is recorded in the background.
@@ -214,7 +218,7 @@ Codex CLI                      VAIBot API                    On-chain
 
 ## Skipped tools
 
-Tools matching `mcp__vaibot__.*` are skipped automatically (matcher uses negative lookahead) so the governance plugin doesn't govern its own MCP queries.
+Tools matching `mcp__vaibot__.*` are skipped automatically by the hook scripts themselves so the governance plugin doesn't govern its own MCP queries.
 
 ## Codex CLI vs ChatGPT Codex
 

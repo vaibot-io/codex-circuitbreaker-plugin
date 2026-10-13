@@ -553,8 +553,8 @@ async function main() {
   const turnId = hookInput.turn_id ?? null
 
   // Skip governance for the governance tools themselves (avoid recursion).
-  // Codex MCP naming: mcp__<server>__<tool>. The hooks.json matcher *should*
-  // already filter these via negative-lookahead, but defence-in-depth here.
+  // Codex MCP naming: mcp__<server>__<tool>. The hooks.json matcher is "*"
+  // (Codex's regex engine has no look-ahead), so this check is the filter.
   // Governance tools are exempt so a governance call cannot recurse into governing
   // itself, and so an operator can still lift containment from inside the agent.
   //
