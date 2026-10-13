@@ -44,3 +44,27 @@ export function clearFinishedAsks(stateDir, { sessionId, turnId, turnEnded = fal
     }
   }
 }
+
+/**
+ * Claim this session's ordinary (not approval_required) run-state once its turn
+ * has ended, for Stop to close. Every call of an ended turn has finished, and a
+ * call that succeeded had its entry consumed by PostToolUse, so what is left is a
+ * call Codex reported no success for: it failed, or never completed. Another
+ * session's entries are never taken. Claiming is the unlink, so a run is closed once.
+ */
+export function takeUnfinishedRuns(stateDir, { sessionId } = {}) {
+  if (!sessionId) return []
+  let files
+  try { files = readdirSync(stateDir).filter((f) => f.endsWith('.json')) } catch { return [] }
+  const taken = []
+  for (const file of files) {
+    const path = join(stateDir, file)
+    let entry
+    try { entry = JSON.parse(readFileSync(path, 'utf-8')) } catch { continue }
+    if (!entry || entry.approval_required || !entry.run_id) continue
+    if (entry.session_id !== sessionId) continue
+    try { unlinkSync(path) } catch { continue } // lost the race — another hook has it
+    taken.push(entry)
+  }
+  return taken
+}

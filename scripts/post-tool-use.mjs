@@ -15,26 +15,14 @@
 import { readFileSync, readdirSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readLock } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
-
-const TIMEOUT_MS = Number(process.env.VAIBOT_TIMEOUT_MS) || 10000
-
-// Resolve the running guard to finalize against. pre-tool-use already launched
-// it (lock written) by the time PostToolUse fires; honour the env override if set.
-function resolveGuard() {
-  const baseUrl = process.env.VAIBOT_GUARD_BASE_URL
-  if (baseUrl) {
-    try {
-      const u = new URL(baseUrl)
-      return { host: u.hostname, port: Number(u.port) || 39111, token: process.env.VAIBOT_GUARD_TOKEN || '' }
-    } catch { /* fall through */ }
-  }
-  const lock = readLock()
-  return lock && lock.port ? { host: lock.host, port: lock.port, token: lock.token } : null
-}
+import { resolveGuard, finalizeRun, transcriptOutcome, transcriptFailure } from './lib/finalize.mjs'
+import { ASK_ABANDON_MS } from './lib/sweep.mjs'
 
 const STATE_DIR = join(tmpdir(), 'vaibot-codex')
-const MAX_STATE_AGE_MS = 5 * 60 * 1000 // 5 minutes
+// An entry is pruned here only once abandoned. A call can run for longer than
+// any short window (a build, a test suite), and its own PostToolUse must still
+// find it; Stop closes this session's leftovers at the end of the turn.
+const MAX_STATE_AGE_MS = ASK_ABANDON_MS
 
 function findRunState(toolName, toolUseId) {
   try {
@@ -47,9 +35,8 @@ function findRunState(toolName, toolUseId) {
       try {
         const data = JSON.parse(readFileSync(join(STATE_DIR, file), 'utf-8'))
 
-        // Expire ordinary entries after 5min. Approval-required entries live
-        // until a hook sweeps them — human decisions can outlast the normal
-        // expiry window.
+        // Expire abandoned ordinary entries. Approval-required entries live
+        // until a hook sweeps them.
         if (!data.approval_required && now - data.ts > MAX_STATE_AGE_MS) {
           try { unlinkSync(join(STATE_DIR, file)) } catch { /* ignore */ }
           continue
@@ -102,7 +89,10 @@ async function main() {
 
   // Detect failure from tool_response. Codex's response shape isn't fully
   // standardised across tool kinds — be defensive.
-  const error = toolResponse?.error ?? toolResponse?.is_error ?? null
+  // A shell command that exits non-zero still reaches PostToolUse, with only its
+  // output as tool_response; its exit status is in the session transcript.
+  const error = (toolResponse?.error ?? toolResponse?.is_error ?? null)
+    || transcriptFailure(transcriptOutcome(hookInput.transcript_path, toolUseId))
   const durationMs = hookInput.duration_ms ?? null
 
   // Skip governance tools
@@ -140,16 +130,7 @@ async function main() {
   if (typeof durationMs === 'number') result.duration_ms = durationMs
   if (error) result.error = String(error).slice(0, 2000)
 
-  try {
-    await fetch(`http://${guard.host}:${guard.port}/v1/finalize/tool`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${guard.token}` },
-      body: JSON.stringify({ sessionId: 'codex', runId: runState.run_id, result }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    })
-  } catch {
-    // Best-effort finalization — don't block the session.
-  }
+  await finalizeRun(guard, runState.run_id, result)
 
   process.exit(0)
 }

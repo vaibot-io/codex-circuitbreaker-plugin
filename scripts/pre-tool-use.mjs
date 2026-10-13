@@ -56,6 +56,7 @@ import { ensureGuardDefault } from '../vendor/vaibot-guard/scripts/lib/guard-lau
 import { decideViaGuard } from '../vendor/vaibot-guard/scripts/lib/guard-client.mjs'
 import { readContainment } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
 import { clearFinishedAsks } from './lib/sweep.mjs'
+import { finalizeRun } from './lib/finalize.mjs'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -746,6 +747,13 @@ async function main() {
         )
       }
       if (rawDecision === 'deny' && result.floor === true) {
+        // Blocked, so it never runs and no PostToolUse closes it.
+        dropRunState(toolCallId)
+        await finalizeRun(guard, data.run_id, {
+          ok: false,
+          outcome: 'blocked',
+          error: `Plugin enforced: deny — ${rawReason ?? toolName}`.slice(0, 2000),
+        })
         const output = {
           hookSpecificOutput: {
             hookEventName: 'PreToolUse',
@@ -829,6 +837,13 @@ async function main() {
     if (decision === 'deny') {
       const reason = rawReason ?? `Denied by policy for ${toolName}`
       clearPendingApproval(toolName, toolInput, cwd)
+      // A denied call never runs, so no PostToolUse closes its run: close it here.
+      dropRunState(toolCallId)
+      await finalizeRun(guard, data.run_id, {
+        ok: false,
+        outcome: 'blocked',
+        error: `Plugin enforced: deny — ${reason}`.slice(0, 2000),
+      })
       const output = {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
