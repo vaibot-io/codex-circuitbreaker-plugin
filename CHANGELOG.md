@@ -4,7 +4,40 @@ All notable changes to `@vaibot/codex-circuitbreaker-plugin`.
 
 ## [Unreleased]
 
+### Added
+- **Answer an approval on your phone, in the dashboard or by email.** In enforce mode
+  a call that needs approval is now held (`POST /v1/hold` on the guard): it shows up
+  as pending on the VAIBot Authenticator, in the dashboard and in an alert email, and
+  Codex waits in `PreToolUse` while the person answers there.
+  - Approved → the call runs, and its closing receipt records the approval and where
+    it was given.
+  - Denied → the call is blocked with `Denied on your phone (VAIBot). Do not retry this
+    action unless the user asks.` (or the dashboard / email link), and closed at once
+    as the person's refusal.
+  - No answer within `VAIBOT_HOLD_WAIT_MS` (default 2 minutes, capped at 150 s) → the
+    call is blocked with a pointer to approve it in VAIBot and retry. The retry pointer
+    is kept, so approving later still lets the retry through.
+  - With only the dashboard to answer on, there is no wait.
+
+  A call that can't be held (a guard older than 2.4.0, no API key) gets the existing
+  deny-with-retry instructions, unchanged. The `PreToolUse` timeout in `hooks.json` is
+  now 180 s so the wait fits inside it.
+
 ### Fixed
+- **A retry pointer is used only by the session that saved it.** The state dir is
+  shared by every Codex session on the machine, and the guard binds an approval to the
+  session that asked for it. So the same call in another session presented the first
+  session's approval and was denied outright (`Approval session mismatch`) instead of
+  being asked again. A pointer now records its session, and one from another session
+  (or saved before this change) is ignored: the call is decided afresh.
+- **`PermissionRequest` no longer asks the guard a second time.** It made a fresh
+  decision for a call `PreToolUse` had already decided, which opened a second guard
+  run that nothing ever closed: every command Codex escalated (for example to run it
+  outside the sandbox) left one behind. It now answers from `PreToolUse`'s decision
+  for the same call, found by session, turn, tool and the call itself (for a shell
+  command, the command: Codex adds a `description` to its input). It also follows the
+  mode the guard reported instead of the local `VAIBOT_MODE`. No matching run →
+  Codex's own prompt, as before.
 - **Every call is finalized with the result it had.** Codex runs `PostToolUse` only
   for a call it counts as succeeded, and has no failure hook. The plugin now closes
   every run it opens exactly once:

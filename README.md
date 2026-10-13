@@ -51,7 +51,17 @@ Codex runs a plugin's hooks only after you trust them. After installing, and aga
 
 **Allowed tool** — passes through silently. A receipt is recorded in the background.
 
-**Approval required (enforce mode)** — VAIBot **blocks** the tool call via `permissionDecision: "deny"` and surfaces actionable approval instructions in the deny reason. Codex shows the deny inline to the agent and the user:
+**Approval required (enforce mode)** — VAIBot first **holds** the call: it shows up as pending on the VAIBot Authenticator app, in the dashboard and in an alert email, and Codex waits (up to `VAIBOT_HOLD_WAIT_MS`, 2 minutes by default) while you answer there. Approve → the call runs. Deny → it is blocked with `Denied on your phone (VAIBot). Do not retry this action unless the user asks.` (or wherever you answered). If nobody answers in time, the call is blocked, still waiting in VAIBot:
+
+```
+VAIBot is holding this Bash call for approval — high risk: outbound network call
+
+No answer yet. Approve it in VAIBot (on your phone, in the VAIBot dashboard, from the email), then ask the
+agent to retry the same action — the plugin will let it through once it
+is approved.
+```
+
+Holding needs `@vaibot/guard` 2.4.0 or later and a phone paired with the VAIBot Authenticator or an email on your account; with only the dashboard there is no wait. When the call can't be held (an older guard, no API key), VAIBot **blocks** the tool call via `permissionDecision: "deny"` and surfaces actionable approval instructions in the deny reason. Codex shows the deny inline to the agent and the user:
 
 ```
 VAIBot blocked this Bash call — high risk: outbound network call
@@ -67,7 +77,7 @@ plugin will short-circuit on the cached approval and allow it.
 
 The receipt is recorded as `blocked_until_approved`. When you approve out-of-band (dashboard or `vaibot approve <hash>` CLI) and then ask the agent to retry the same intent, the plugin reads its cached approval pointer, sends `approved_content_hash` to the server, and the server short-circuits to `previously_approved: true`. The retry passes through as `allow` — the loop terminates.
 
-**Native approval prompts (`PermissionRequest`)** — when Codex itself is about to ask you to approve an action (a sandbox/network escalation, an `on-request` confirmation), VAIBot's `PermissionRequest` hook routes that prompt through the guard: it **auto-approves** what the guard allows (so you aren't asked about safe actions), **auto-denies** what the guard denies, and **declines** for anything that needs a human — letting Codex show its normal approval prompt. This layers on top of the `PreToolUse` floor; `PreToolUse` still independently blocks hard-denies and `approval_required` actions regardless of your `approval_policy`.
+**Native approval prompts (`PermissionRequest`)** — when Codex itself is about to ask you to approve an action (a sandbox/network escalation, an `on-request` confirmation), VAIBot's `PermissionRequest` hook answers from the decision `PreToolUse` already made for that call: it **auto-approves** what the guard allowed or you approved in VAIBot (so you aren't asked about safe actions), **auto-denies** what the guard denied, and **declines** for anything else — letting Codex show its normal approval prompt. This layers on top of the `PreToolUse` floor; `PreToolUse` still independently blocks hard-denies and `approval_required` actions regardless of your `approval_policy`.
 
 **Hard deny** — the tool is blocked outright via `permissionDecision: "deny"`. Codex shows the deny reason inline.
 
@@ -159,6 +169,7 @@ All environment variables are optional.
 | `VAIBOT_MODE` | `observe` | `observe` or `enforce` |
 | `VAIBOT_API_URL` | `https://api.vaibot.io` | API base URL |
 | `VAIBOT_TIMEOUT_MS` | `10000` | Request timeout in ms |
+| `VAIBOT_HOLD_WAIT_MS` | `120000` | How long Codex waits for an answer in VAIBot to a held call (capped at 150000, inside the hook's timeout) |
 | `VAIBOT_FAIL_OPEN` | `false` | If `true`, allow tool calls when the API is unreachable |
 | `VAIBOT_DEBUG` | _(unset)_ | Set to `1` for verbose decision logging |
 | `VAIBOT_DASHBOARD_URL` | `https://www.vaibot.io` | Used in claim-account messages |

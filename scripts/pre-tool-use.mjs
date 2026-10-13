@@ -57,6 +57,8 @@ import { decideViaGuard } from '../vendor/vaibot-guard/scripts/lib/guard-client.
 import { readContainment } from '../vendor/vaibot-guard/scripts/lib/guard-bootstrap.mjs'
 import { clearFinishedAsks } from './lib/sweep.mjs'
 import { finalizeRun } from './lib/finalize.mjs'
+import { holdAndWait, ANSWER_PLACE } from './lib/hold.mjs'
+import { callKey, commandKey } from './lib/call-key.mjs'
 import { createRequire } from 'node:module'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -381,41 +383,30 @@ function dropRunState(toolCallId) {
 // Untrusted hint only. Server re-verifies intent (tool + command + cwd)
 // against the referenced approved receipt before honoring a short-circuit.
 
-// Keyed on the EXACT call — tool, full input (stable key order), cwd — not on a
-// summary of it. extractCommand summarises apply_patch/Edit/Write as
-// "<tool> <path>", so every change to one file shared a pointer: a retry could
-// present a DIFFERENT change's approval id (guard 2.3.0: a hard pending-deny or a
-// scope-mismatch deny). Two different calls never share a pointer now; a retry
-// of the identical call still finds its own.
-function stableStringify(value) {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`
-  }
-  return JSON.stringify(value) ?? 'null'
-}
-
-function callKey(tool, input, cwd) {
-  return createHash('sha256').update(`${tool}|${stableStringify(input ?? {})}|${cwd ?? ''}`).digest('hex').slice(0, 32)
-}
-
 function pendingPath(tool, input, cwd) {
   return join(PENDING_DIR, `${callKey(tool, input, cwd)}.json`)
 }
 
-function readPendingApproval(tool, input, cwd) {
+// A pointer is this session's only. The guard binds an approval to the session
+// that asked for it, so presenting another session's (the state dir is shared by
+// every Codex session on the machine) was denied outright ("Approval session
+// mismatch") instead of being asked again. A pointer from another session, or
+// one written before pointers recorded their session, is ignored: the call is
+// decided afresh.
+function readPendingApproval(tool, input, cwd, sessionId) {
   try {
     const p = pendingPath(tool, input, cwd)
     if (!existsSync(p)) return null
-    return JSON.parse(readFileSync(p, 'utf-8'))
+    const pointer = JSON.parse(readFileSync(p, 'utf-8'))
+    return pointer?.session_id && pointer.session_id === sessionId ? pointer : null
   } catch { return null }
 }
 
-function writePendingApproval(tool, input, cwd, contentHash) {
+function writePendingApproval(tool, input, cwd, contentHash, sessionId) {
   try {
     ensureStateDir()
     mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
-    writeFileSync(pendingPath(tool, input, cwd), JSON.stringify({ content_hash: contentHash, ts: Date.now() }), { mode: 0o600 })
+    writeFileSync(pendingPath(tool, input, cwd), JSON.stringify({ content_hash: contentHash, session_id: sessionId, ts: Date.now() }), { mode: 0o600 })
   } catch { /* best-effort */ }
 }
 
@@ -633,7 +624,7 @@ async function main() {
 
   // Retry awareness: if we previously got approval_required for this exact
   // intent and saved a pointer, present it to the guard for redemption.
-  const pending = readPendingApproval(toolName, toolInput, cwd)
+  const pending = readPendingApproval(toolName, toolInput, cwd, sessionId)
 
   if (process.env.VAIBOT_DEBUG === '1') {
     const ck = callKey(toolName, toolInput, cwd)
@@ -734,6 +725,10 @@ async function main() {
       turn_id: turnId,
       approval_required: rawDecision === 'approval_required' && !data.previously_approved,
       intent_key: callKey(toolName, toolInput, cwd),
+      // How the PermissionRequest hook finds this run: Codex hands it a
+      // different tool_input for the same shell command (adds a description).
+      command_key: commandKey(toolName, toolInput),
+      effective_mode: effectiveMode,
       ts: Date.now(),
     })
 
@@ -781,11 +776,53 @@ async function main() {
       const contentHash = data.content_hash ?? ''
       const riskLabel = data.risk?.risk ?? 'elevated'
 
+      // Hold the call so the person can answer it away from the terminal (VAIBot
+      // Authenticator, dashboard, email) while Codex waits — see lib/hold.mjs.
+      const hold = await holdAndWait(guard, { runId: data.run_id, sessionId })
+      if (hold.held && hold.answer === 'approved') {
+        // Runs now. PostToolUse (or Stop) closes it and reports the approval.
+        clearPendingApproval(toolName, toolInput, cwd)
+        saveRunState(toolCallId, {
+          run_id: data.run_id,
+          content_hash: contentHash,
+          receipt_id: data.receipt_id,
+          decision: rawDecision,
+          risk: data.risk?.risk,
+          tool_name: toolName,
+          tool_call_id: toolCallId,
+          tool_use_id: toolUseId,
+          session_id: sessionId,
+          turn_id: turnId,
+          approval_required: false,
+          approval: 'approved',
+          intent_key: callKey(toolName, toolInput, cwd),
+          command_key: commandKey(toolName, toolInput),
+          effective_mode: effectiveMode,
+          ts: Date.now(),
+        })
+        process.exit(0)
+      }
+      if (hold.held && hold.answer === 'denied') {
+        // Never runs, so close it now with the person's answer.
+        clearPendingApproval(toolName, toolInput, cwd)
+        dropRunState(toolCallId)
+        await finalizeRun(guard, data.run_id, { outcome: 'denied_by_reviewer', approval: 'denied' })
+        const where = ANSWER_PLACE[hold.source] ?? 'in VAIBot'
+        process.stdout.write(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: `Denied ${where} (VAIBot). Do not retry this action unless the user asks.`,
+          },
+        }))
+        process.exit(0)
+      }
+
       // Save pointer so the retry of this exact intent can short-circuit. On
       // the next PreToolUse for the same exact call (tool, input, cwd), the plugin
       // reads this pointer, sends approved_content_hash, and the server
       // returns previously_approved=true → decision coerced to allow.
-      if (contentHash) writePendingApproval(toolName, toolInput, cwd, contentHash)
+      if (contentHash) writePendingApproval(toolName, toolInput, cwd, contentHash, sessionId)
 
       // This call is DENIED, so it never runs and no PostToolUse will ever
       // consume its run-state. Left behind, the entry (approval_required: true)
@@ -813,8 +850,17 @@ async function main() {
       const approveUrl = contentHash
         ? `${DASHBOARD_URL}/verify/decision/${encodeURIComponent(contentHash)}`
         : `${DASHBOARD_URL}/dashboard`
-      const denyReason =
-        `VAIBot blocked this ${toolName} call — ${riskLabel} risk: ${reason}\n` +
+      // Held but not answered yet: it is waiting in VAIBot, so point there. A
+      // call that couldn't be held keeps the existing instructions.
+      const places = hold.held
+        ? [hold.channels?.authenticator && 'on your phone', 'in the VAIBot dashboard', hold.channels?.email && 'from the email'].filter(Boolean)
+        : []
+      const denyReason = hold.held
+        ? `VAIBot is holding this ${toolName} call for approval — ${riskLabel} risk: ${reason}\n` +
+          `\nNo answer yet. Approve it in VAIBot (${places.join(', ')}), then ask the\n` +
+          `agent to retry the same action — the plugin will let it through once it\n` +
+          `is approved.`
+        : `VAIBot blocked this ${toolName} call — ${riskLabel} risk: ${reason}\n` +
         (contentHash ? `content_hash: ${contentHash}\n` : '') +
         `\nTo approve and retry, do ONE of:\n` +
         `  • Open ${approveUrl}\n` +
