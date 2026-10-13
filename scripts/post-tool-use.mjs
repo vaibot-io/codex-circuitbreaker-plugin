@@ -127,6 +127,8 @@ async function main() {
   // left failures on the receipt as allowed. (Codex's schema types
   // tool_response as any JSON value, so `error` is only what it happens to carry.)
   if (error) result.ok = false
+  // Approved while held (on the phone, dashboard or email): say so on the receipt.
+  if (runState.approval === 'approved') result.approval = 'approved'
   if (typeof durationMs === 'number') result.duration_ms = durationMs
   if (error) result.error = String(error).slice(0, 2000)
 

@@ -50,6 +50,7 @@ async function main() {
           ok: false,
           outcome: 'blocked',
           error: reported ?? 'tool call did not complete successfully',
+          ...(entry.approval === 'approved' ? { approval: 'approved' } : {}),
         })
       }))
     }

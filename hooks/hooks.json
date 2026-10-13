@@ -19,7 +19,7 @@
           {
             "type": "command",
             "command": "node \"$PLUGIN_ROOT/scripts/pre-tool-use.mjs\"",
-            "timeout": 15
+            "timeout": 180
           }
         ]
       }
