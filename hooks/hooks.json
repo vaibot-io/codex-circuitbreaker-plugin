@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CODEX_PLUGIN_ROOT/scripts/session-start.mjs\"",
+            "command": "node \"$PLUGIN_ROOT/scripts/session-start.mjs\"",
             "timeout": 10
           }
         ]
@@ -14,11 +14,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "^(?!mcp__vaibot__).*",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CODEX_PLUGIN_ROOT/scripts/pre-tool-use.mjs\"",
+            "command": "node \"$PLUGIN_ROOT/scripts/pre-tool-use.mjs\"",
             "timeout": 15
           }
         ]
@@ -26,11 +26,11 @@
     ],
     "PermissionRequest": [
       {
-        "matcher": "^(?!mcp__vaibot__).*",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CODEX_PLUGIN_ROOT/scripts/permission-request.mjs\"",
+            "command": "node \"$PLUGIN_ROOT/scripts/permission-request.mjs\"",
             "timeout": 15
           }
         ]
@@ -38,11 +38,11 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(?!mcp__vaibot__).*",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CODEX_PLUGIN_ROOT/scripts/post-tool-use.mjs\"",
+            "command": "node \"$PLUGIN_ROOT/scripts/post-tool-use.mjs\"",
             "timeout": 10
           }
         ]
@@ -53,7 +53,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CODEX_PLUGIN_ROOT/scripts/stop.mjs\"",
+            "command": "node \"$PLUGIN_ROOT/scripts/stop.mjs\"",
             "timeout": 10
           }
         ]
